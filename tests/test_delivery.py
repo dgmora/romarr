@@ -235,6 +235,36 @@ m.transfer(*sys.argv[2:])
         self.assertEqual(list(self.stage.glob(".retired-*")), [])
         self.assertEqual({p.name for p in (self.library/"psx/Demo").iterdir()}, {"Demo.bin", "Demo.cue"})
 
+    def test_sigkill_during_retired_deletion_recovers(self):
+        self.put("psx/Demo/Demo.bin", b"track")
+        self.put("psx/Demo/Demo.cue", b'FILE "Demo.bin" BINARY')
+        code = """import importlib.util, os, signal, sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('delivery', sys.argv[1])
+m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+original=m.shutil.rmtree
+def remove(path, *args, **kwargs):
+    path=Path(path)
+    if path.name.startswith('.retired-') and (path/'game').is_dir():
+        next((path/'game').iterdir()).unlink()
+        os.kill(os.getpid(), signal.SIGKILL)
+    return original(path, *args, **kwargs)
+m.shutil.rmtree=remove
+m.transfer(*sys.argv[2:])
+"""
+        result = subprocess.run([sys.executable, "-c", code, str(SCRIPT), self.url,
+                                 str(self.stage), str(self.library)])
+        self.assertEqual(result.returncode, -9)
+        self.assertFalse((self.stage / "psx/Demo").exists())
+        self.assertEqual(list((self.source / "psx/Demo").iterdir()), [])
+        retired = list(self.stage.glob(".retired-*/game"))
+        self.assertEqual(len(retired), 1)
+        self.assertEqual(len(list(retired[0].iterdir())), 1)
+        self.assertEqual({p.name for p in (self.library / "psx/Demo").iterdir()}, {"Demo.bin", "Demo.cue"})
+        self.deliver()
+        self.assertEqual(list(self.stage.glob(".retired-*")), [])
+
+
     def test_read_only_daemon_refuses_cleanup_without_losing_staging(self):
         if not self.daemon_mode:
             self.skipTest("sandbox prohibits rsync daemon setgroups; run on ordinary CI")
