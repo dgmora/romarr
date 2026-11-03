@@ -739,6 +739,7 @@ class ROMarr:
         if str(e.get("ROMARR_STANDALONE_EXPORT", "")).lower() in ("1", "true", "yes"):
             from .standalone import configure_export
             configure_export(self.store, self.library)
+            self.reload_libraries()
 
         self.scheduler = Scheduler()
         self.scheduler.add(

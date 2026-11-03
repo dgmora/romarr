@@ -2,6 +2,7 @@ import pytest
 from romarr.app import ROMarr
 from romarr.library import import_rom
 from romarr.platforms import resolve
+from romarr.store import Store
 
 
 def test_profile_is_opt_in(tmp_path):
@@ -15,7 +16,9 @@ def test_profile_normalizes_settings_and_cleans_only_import_scratch(tmp_path):
     published=library/"psx/Demo.bin"; published.write_bytes(b"complete")
     receiver=tmp_path/"receiver/.romarr-incoming"; receiver.mkdir(parents=True)
     (receiver/"retained.bin").write_bytes(b"retry")
+    Store(tmp_path/"state.json").put_item("libraries", {"id":"managed", "type":"folder", "name":"Outgoing", "path":str(library), "layout":"nested", "enable":True})
     s=ROMarr({"ROMARR_DATA":str(tmp_path/"state.json"),"LIBRARY_KIND":"folder", "LIBRARY_PATH":str(library),"ROMARR_STANDALONE_EXPORT":"1"})
+    assert all(s.library_layout(cfg)=="flat" for cfg, _ in s.game_libraries)
     assert s.store.settings["acquisition_only"] and s.store.settings["standalone_export"]
     assert s.store.settings["library_layout"]=="flat"
     assert not scratch.exists() and published.read_bytes()==b"complete"
