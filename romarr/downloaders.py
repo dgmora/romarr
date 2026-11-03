@@ -494,6 +494,7 @@ class TransmissionConfig:
     password: str = ""
     category: str = "romarr"
     timeout: int = 30
+    save_path: str = ""
 
 
 class Transmission:
@@ -518,6 +519,7 @@ class Transmission:
         self._config = config
         self._session = session or requests.Session()
         self._session_id = ""
+        self.last_job_id = ""
 
     @property
     def configured(self) -> bool:
@@ -552,9 +554,11 @@ class Transmission:
             return False
 
     def add(self, magnet_or_url: str, *, save_path: str | None = None) -> bool:
+        self.last_job_id = ""
         arguments = {"filename": magnet_or_url}
-        if save_path:
-            arguments["download-dir"] = save_path
+        destination = save_path or self._config.save_path
+        if destination:
+            arguments["download-dir"] = destination
         if self._config.category:
             arguments["labels"] = [self._config.category]
         try:
@@ -569,7 +573,60 @@ class Transmission:
         if body.get("result") != "success":
             log.warning("Transmission refused the torrent: %s", body.get("result"))
             return False
+        added = body.get("arguments", {})
+        job = added.get("torrent-added") or added.get("torrent-duplicate") or {}
+        identity = str(job.get("hashString") or "").lower()
+        if not identity:
+            log.warning("Transmission did not return a torrent identity")
+            return False
+        if added.get("torrent-duplicate"):
+            # torrent-add does not apply labels or move an existing torrent.
+            # Never adopt another application's data or change its ownership.
+            try:
+                existing = self._call("torrent-get", {"ids": [identity],
+                    "fields": ["hashString", "labels", "downloadDir"]})
+            except Exception as exc:
+                log.warning("Could not inspect duplicate torrent: %s", exc)
+                return False
+            rows = existing.get("arguments", {}).get("torrents", [])
+            owned = (existing.get("result") == "success" and len(rows) == 1
+                     and str(rows[0].get("hashString") or "").lower() == identity
+                     and bool(self._config.category) and bool(destination)
+                     and self._config.category in rows[0].get("labels", [])
+                     and str(rows[0].get("downloadDir") or "").rstrip("/")
+                         == str(destination).rstrip("/"))
+            if not owned:
+                log.warning("Duplicate torrent is outside ROMarr's label or download directory; refusing adoption")
+                return False
+        self.last_job_id = identity
         return True
+
+
+    def completed(self) -> list[dict]:
+        body = self._call("torrent-get", {"fields": [
+            "name", "hashString", "downloadDir", "labels",
+            "leftUntilDone", "percentDone", "totalSize",
+        ]})
+        if body.get("result") != "success":
+            raise RuntimeError("Transmission could not list completed downloads")
+        out = []
+        for torrent in body.get("arguments", {}).get("torrents", []):
+            if self._config.category and self._config.category not in torrent.get("labels", []):
+                continue
+            if (torrent.get("leftUntilDone", 1) != 0
+                    or torrent.get("percentDone", 0) < 1
+                    or torrent.get("totalSize", 0) <= 0):
+                continue
+            directory = str(torrent.get("downloadDir") or "").rstrip("/")
+            if self._config.save_path and directory != self._config.save_path.rstrip("/"):
+                continue
+            name = str(torrent.get("name") or "")
+            if directory and name:
+                out.append({"name": name, "hash": torrent.get("hashString", ""),
+                            "id": str(torrent.get("hashString") or "").lower(),
+                            "content_path": directory + "/" + name,
+                            "save_path": directory, "category": self._config.category})
+        return out
 
 
 class Vuze(Transmission):
@@ -3417,6 +3474,7 @@ CLIENT_TYPES = {
             FIELD("username", "Username"),
             FIELD("password", "Password", "secret"),
             FIELD("category", "Label", default="romarr"),
+            FIELD("save_path", "Download directory"),
         ],
     },
     "deluge": {
@@ -3822,7 +3880,8 @@ def build_client(cfg: dict):
     elif kind == "transmission":
         client = Transmission(TransmissionConfig(
             base_url=url, username=cfg.get("username", ""),
-            password=cfg.get("password", ""), category=category))
+            password=cfg.get("password", ""), category=category,
+            save_path=cfg.get("save_path", "")))
     elif kind == "deluge":
         client = Deluge(DelugeConfig(
             base_url=url, password=cfg.get("password", ""), category=category))

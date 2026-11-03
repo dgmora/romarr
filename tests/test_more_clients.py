@@ -94,7 +94,7 @@ def test_transmission_answers_the_409_session_challenge():
     session = FakeSession([
         FakeResponse(409, {}, {"X-Transmission-Session-Id": "abc123"}),
         FakeResponse(200, {"result": "success",
-                           "arguments": {"torrent-added": {"id": 1}}}),
+                           "arguments": {"torrent-added": {"id": 1, "hashString": "a" * 40}}}),
     ])
     client = Transmission(TransmissionConfig(base_url="http://t:9091"),
                           session=session)
@@ -142,14 +142,19 @@ def test_transmission_reports_a_non_success_result_as_failure():
                             session=session).add("magnet:?xt=urn:btih:a")
 
 
-def test_transmission_treats_a_duplicate_as_added():
-    """`torrent-duplicate` means it is already there, which is the outcome
-    the caller wanted. Calling it a failure makes a re-run look broken."""
+def test_transmission_accepts_its_own_duplicate():
+    """Only an existing torrent in our label AND directory can be adopted."""
     from romarr.downloaders import Transmission, TransmissionConfig
 
-    session = FakeSession([FakeResponse(
-        200, {"result": "success", "arguments": {"torrent-duplicate": {"id": 3}}})])
-    assert Transmission(TransmissionConfig(base_url="http://t:9091"),
+    session = FakeSession([
+        FakeResponse(200, {"result": "success", "arguments": {
+            "torrent-duplicate": {"id": 3, "hashString": "a" * 40}}}),
+        FakeResponse(200, {"result": "success", "arguments": {"torrents": [{
+            "hashString": "a" * 40, "labels": ["romarr"],
+            "downloadDir": "/downloads/romarr"}]}}),
+    ])
+    assert Transmission(TransmissionConfig(base_url="http://t:9091",
+                        save_path="/downloads/romarr"),
                         session=session).add("magnet:?xt=urn:btih:a")
 
 
