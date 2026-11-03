@@ -6111,6 +6111,7 @@ class ROMarr:
                 for item in self.queue:
                     if item.state == "import-failed":
                         item.state = "grabbed"
+                        item.detail = ""
             self.store.save()
         results = []
         finished = []
@@ -6213,6 +6214,7 @@ class ROMarr:
                 results.append({"name": name, "ok": False, "reason": detail})
                 if queue_item is not None:
                     queue_item.state = "import-failed"
+                    queue_item.detail = detail
                 continue
             target_cfg, target_lib = target
             label = target_cfg.get("name") or getattr(target_lib, "name", "library")
@@ -6258,6 +6260,7 @@ class ROMarr:
                 # Marked so the scheduled sweep never re-attempts it; the
                 # Tasks page button clears failure marks to retry.
                 queue_item.state = "imported" if any_ok else "import-failed"
+                queue_item.detail = "" if any_ok else str(outcomes[0].reason)
             if any_ok:
                 if (not self.store.settings.get("acquisition_only", False)
                         and self.store.settings.get("rescan_after_import", True)):

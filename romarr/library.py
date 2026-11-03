@@ -546,12 +546,19 @@ def import_rom(download: Path, platform: Platform, library_root: Path, *,
         candidates = source.names()
     except MissingArchiveTool as exc:
         return [ImportResult(False, None, str(exc))]
+    except subprocess.CalledProcessError as exc:
+        error = exc.stderr or str(exc)
+        if isinstance(error, bytes):
+            error = error.decode(errors="replace")
+        return [ImportResult(False, None, f"Cannot read {download.name}: {error.strip()}")]
 
     chosen_sets = pick_all_rom_sets(candidates, platform, read=source.read)
     if not chosen_sets:
-        return [ImportResult(
-            False, None,
-            f"no {platform.name} ROM among {len(candidates)} file(s)")]
+        reason = f"no {platform.name} ROM among {len(candidates)} file(s)"
+        nested = [name for name in candidates if Path(name).suffix.lower() in ARCHIVE_SUFFIXES]
+        if download.is_dir() and nested and not platform.archive_is_the_rom:
+            reason += f"; archive inside download directory cannot be imported: {nested[0]}"
+        return [ImportResult(False, None, reason)]
 
     results: list[ImportResult] = []
     for chosen in chosen_sets:
