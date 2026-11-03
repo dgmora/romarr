@@ -3023,6 +3023,8 @@ RENDER.media=()=>settingsPage('Media Management',
      +'Per-library overrides live on the Libraries page.')
   +chk('rename_on_import','Use DAT names for verified single-file imports (disc-set filenames stay intact)',SETTINGS.rename_on_import)
   +chk('overwrite_existing','Overwrite an existing file',SETTINGS.overwrite_existing)
+  +chk('acquisition_only','Acquisition only — this folder is outgoing staging, not the permanent library',SETTINGS.acquisition_only)
+  +chk('reconcile_after_import','Reconcile verified library games after an import (disabled in acquisition-only mode)',SETTINGS.reconcile_after_import)
   +chk('rescan_after_import','Tell your library server to rescan after an import',SETTINGS.rescan_after_import)
   +chk('clamav_enabled','Scan downloads with ClamAV before importing them',SETTINGS.clamav_enabled)
   +fld('clamav_address','ClamAV address',SETTINGS.clamav_address||'','text',

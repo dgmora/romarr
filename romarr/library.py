@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import threading
+import tempfile
 import time
 import zipfile
 from dataclasses import dataclass, field
@@ -477,12 +478,44 @@ def platform_dir(library_root: Path, platform: "Platform | str", *,
     return base
 
 
+# Serialize publication by concurrent import requests in this process.
+_publish_lock = threading.Lock()
+
+
+def _publish_import(staged: Path, destination: Path, *, overwrite: bool) -> str:
+    with _publish_lock:
+        if destination.is_symlink():
+            return "refusing to replace a symlink destination"
+        if staged.is_dir():
+            if destination.exists():
+                # Sender cleanup can leave an empty disc directory. rmdir is
+                # atomic and refuses files, symlinks and nonempty directories.
+                try:
+                    destination.rmdir()
+                except OSError:
+                    return ("cannot atomically replace an existing disc directory; "
+                            "move it aside before importing" if overwrite
+                            else "already in the library")
+            staged.rename(destination)
+        elif overwrite:
+            if destination.is_dir():
+                return "destination is a directory"
+            os.replace(staged, destination)
+        else:
+            # Unlike rename on POSIX, link refuses an existing destination.
+            try:
+                os.link(staged, destination)
+            except FileExistsError:
+                return "already in the library"
+    return ""
+
+
 def import_rom(download: Path, platform: Platform, library_root: Path, *,
                overwrite: bool = False, dats=None,
                require_verified: bool = False,
                layout: str = "flat", translation: bool = False,
                rename: bool = False,
-               platform_folders=None) -> list[ImportResult]:
+               platform_folders=None, export_only: bool = False) -> list[ImportResult]:
     """Place every ROM from a finished download into the library.
 
     A cartridge zip may hold several games (a 3-in-1 collection, a bundle)
@@ -496,6 +529,10 @@ def import_rom(download: Path, platform: Platform, library_root: Path, *,
     The rename option uses verified DAT names for single-file ROMs, retaining
     the physical extension. Multi-file members keep their reference names.
     """
+    if export_only and str(layout).lower() != "flat":
+        return [ImportResult(False, None, "standalone export supports only flat library layout")]
+    if export_only and overwrite:
+        return [ImportResult(False, None, "overwriting published exports is disabled")]
     if not download.exists():
         msg = (
             f"download path does not exist in this container: {download}. "
@@ -530,52 +567,43 @@ def import_rom(download: Path, platform: Platform, library_root: Path, *,
                                   layout=layout, translation=translation,
                                   platform_folders=platform_folders)
 
-        if not chosen.is_multi_file:
-            target_dir.mkdir(parents=True, exist_ok=True)
-            name = _import_name(chosen.primary, verdict, rename=rename)
-            destination = target_dir / name
-            if destination.exists() and not overwrite:
-                results.append(
-                    ImportResult(False, destination, "already in the library"))
-                continue
-            source.copy(chosen.primary, destination)
-            log.info("imported %s -> %s", chosen.primary, destination)
-            results.append(ImportResult(True, destination,
-                                        verification=verdict))
-            continue
-
-        # A digital set is named after the download, not its primary: every
-        # repack's installer is called setup.exe, and a library of
-        # directories all named "setup" is a library of nothing.
-        set_name = (_digital_set_name(download) if platform.media == "digital"
-                    else _set_name(chosen.primary))
-        destination = target_dir / set_name
-        if destination.exists() and any(destination.iterdir()) and not overwrite:
-            results.append(
-                ImportResult(False, destination, "already in the library"))
-            continue
-        destination.mkdir(parents=True, exist_ok=True)
-
-        written: dict[str, str] = {}
-        for member in chosen.members:
-            name = Path(member.replace("\\", "/")).name
-            if not is_safe_name(name, destination):
-                log.warning("refusing set member with an unusable name: %r",
-                            member)
-                continue
-            if name in written:
-                results.append(ImportResult(
-                    False, destination,
-                    f"two files in this download are both called {name!r} "
-                    f"({written[name]} and {member}); refusing to guess which "
-                    "one the game needs"))
-                break
-            source.copy(member, destination / name)
-            written[name] = member
-        else:
-            log.info("imported %d files -> %s", len(written), destination)
-            results.append(ImportResult(True, destination,
-                                        verification=verdict))
+        target_dir.mkdir(parents=True, exist_ok=True)
+        # Scratch and publication share a filesystem, including nested layouts
+        # and custom platform folders. Readers never see a partially copied set.
+        with tempfile.TemporaryDirectory(prefix=".romarr-import-", dir=target_dir) as tmp:
+            staged = Path(tmp) / "game"
+            if not chosen.is_multi_file:
+                name = _import_name(chosen.primary, verdict, rename=rename)
+                destination = target_dir / name
+                source.copy(chosen.primary, staged)
+            else:
+                set_name = (_digital_set_name(download) if platform.media == "digital"
+                            else _set_name(chosen.primary))
+                destination = target_dir / set_name
+                staged.mkdir()
+                written: dict[str, str] = {}
+                error = ""
+                for member in chosen.members:
+                    name = Path(member.replace("\\", "/")).name
+                    if not is_safe_name(name, staged):
+                        error = f"unusable set member name: {member!r}"
+                        break
+                    if name in written:
+                        error = (f"two files in this download are both called {name!r} "
+                                 f"({written[name]} and {member}); refusing to guess which "
+                                 "one the game needs")
+                        break
+                    source.copy(member, staged / name)
+                    written[name] = member
+                if error:
+                    results.append(ImportResult(False, destination, error))
+                    continue
+            reason = _publish_import(staged, destination, overwrite=overwrite)
+            if reason:
+                results.append(ImportResult(False, destination, reason))
+            else:
+                log.info("imported %s -> %s", chosen.primary, destination)
+                results.append(ImportResult(True, destination, verification=verdict))
 
     return results
 

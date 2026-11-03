@@ -223,7 +223,8 @@ def test_nothing_is_overwritten_silently(tmp_path):
     assert "already in the library" in again.reason
 
     forced = import_rom(downloads / "d.zip", PSX, lib, overwrite=True)
-    assert forced.ok
+    assert not forced.ok
+    assert "cannot atomically replace" in forced.reason
 
 
 def test_a_missing_download_still_explains_the_mount(tmp_path):
