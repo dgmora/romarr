@@ -3300,6 +3300,14 @@ def hand_off_with_id(client, url: str, *, name: str = "") -> tuple[bool, str]:
     return ok, (getattr(client, "last_job_id", "") or "") if ok else ""
 
 
+class AmbiguousQueueMatch(ValueError):
+    def __init__(self, items):
+        self.items = items
+        super().__init__("Multiple pending requests match the same download ("
+                         + ", ".join(item.game for item in items)
+                         + "); resolve duplicate queue entries before retrying import")
+
+
 def match_queue_item(queue, download: dict):
     """The queue row a finished download belongs to, or None.
 
@@ -3309,12 +3317,18 @@ def match_queue_item(queue, download: dict):
     """
     found = str(download.get("hash") or "").strip().lower()
     job = str(download.get("id") or "").strip()
+    def select(matches):
+        pending = [item for item in matches if item.state == "grabbed"]
+        if len(pending) > 1:
+            raise AmbiguousQueueMatch(pending)
+        return pending[0] if pending else matches[0] if matches else None
+
     if found or job:
-        for item in queue:
-            if found and item.release_id == f"btih:{found}":
-                return item
-            if job and item.download_id == job:
-                return item
+        matches = [item for item in queue
+                   if (found and item.release_id == f"btih:{found}")
+                   or (job and item.download_id == job)]
+        if matches:
+            return select(matches)
     tags = {part.strip() for part in str(download.get("tags") or "").split(",")
             if part.strip()}
     tag_matches = [item for item in queue
