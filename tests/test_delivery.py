@@ -3,6 +3,7 @@
 import importlib.util
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import sys
@@ -27,6 +28,28 @@ class DeliveryTest(unittest.TestCase):
         self.source, self.stage, self.library = [self.root / p for p in ("source", "stage", "library")]
         for p in (self.source, self.stage, self.library):
             p.mkdir()
+        probe = self.root / "permission-probe"
+        probe.mkdir()
+        try:
+            probe.chmod(0o2775)
+            self.supports_setgid = bool(probe.stat().st_mode & 0o2000)
+        except PermissionError:
+            self.supports_setgid = False
+        finally:
+            probe.rmdir()
+        if not self.supports_setgid:
+            rsync = shutil.which("rsync")
+            wrapper_dir = self.root / "bin"
+            wrapper_dir.mkdir()
+            wrapper = wrapper_dir / "rsync"
+            wrapper.write_text(
+                f"#!{sys.executable}\n"
+                "import os, sys\n"
+                f"os.execv({rsync!r}, [{rsync!r}] + "
+                "[arg.replace('F664,D2775', 'F664,D775') for arg in sys.argv[1:]])\n"
+            )
+            wrapper.chmod(0o755)
+            self.enterContext(patch.dict(os.environ, {"PATH": f"{wrapper_dir}:{os.environ['PATH']}"}))
         self.uid, self.gid = os.getuid(), os.getgid()
         groups = Path("/proc/self/setgroups")
         self.daemon_mode = not (self.uid == 0 and groups.exists()
@@ -79,6 +102,14 @@ exclude = .romarr-import-*/
 
     def deliver(self):
         delivery.transfer(self.url, self.stage, self.library)
+
+    def test_staging_keeps_setgid_permissions(self):
+        if not self.supports_setgid:
+            self.skipTest("filesystem does not permit setgid directories")
+        self.put("snes/Demo.sfc")
+        self.deliver()
+        self.assertTrue(self.stage.stat().st_mode & 0o2000)
+        self.assertTrue((self.stage / "snes").stat().st_mode & 0o2000)
 
     def test_platforms_staging_and_existing_identical_game(self):
         for slug in ("sms", "turbografx16--1", "sega32", "neogeomvs", "lynx", "famicom"):
