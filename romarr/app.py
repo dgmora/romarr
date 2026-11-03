@@ -57,7 +57,8 @@ from .dat import DatIndex, parse_dat
 from .decompress import run_batch as run_decompress_batch, scan_compressed
 from .titled import TitleDBIndex, build_index as build_titled_index, validate_switch_rom
 from .downloaders import (
-    AmbiguousQueueMatch, CLIENT_TYPES, NZBGet, NzbgetConfig, SABnzbd, SabConfig, build_client,
+    AmbiguousQueueMatch, CLIENT_TYPES, NZBGet, NzbgetConfig, SABnzbd, SabConfig,
+    Transmission, build_client,
     hand_off_with_id, match_queue_item, merge_secrets, pick_client, redact,
 )
 from .indexers import INDEXER_TYPES, build_indexer, merge_indexer_secrets, redact_indexer
@@ -1961,11 +1962,8 @@ class ROMarr:
             if not ok:
                 failure_detail = (client.last_error or
                                   "qBittorrent could not select the exact file")
-        elif (isinstance(client, QBittorrent) and callable(local_fetch)
+        elif ((isinstance(client, QBittorrent) or type(client) is Transmission) and callable(local_fetch)
                 and local_fetch(pick.download_url)):
-            # Prowlarr's authenticated URL is LAN-only and contains its API
-            # key. Fetch it here, then upload only the .torrent bytes to the
-            # download client; never give qBittorrent that URL.
             try:
                 torrent = self.prowlarr.fetch_torrent(pick.download_url)
             except ProwlarrDownloadError as err:
@@ -1973,9 +1971,6 @@ class ROMarr:
                 release_fault = False
                 failure_detail = str(err)
             else:
-                # Prowlarr may answer a .torrent request with a terminal magnet
-                # redirect. Keep the safe local fetch path, then pass that URI
-                # to qBittorrent instead of treating it as torrent bytes.
                 if isinstance(torrent, str):
                     ok = client.add(torrent)
                 else:
@@ -1984,7 +1979,7 @@ class ROMarr:
                 release_fault = False
                 if not ok:
                     failure_detail = (
-                        "qBittorrent did not confirm the uploaded torrent")
+                        f"{client.name} did not confirm the uploaded torrent")
         else:
             ok, download_id = hand_off_with_id(client, pick.download_url,
                                                name=pick.title)
