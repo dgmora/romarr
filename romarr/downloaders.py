@@ -554,8 +554,14 @@ class Transmission:
             return False
 
     def add(self, magnet_or_url: str, *, save_path: str | None = None) -> bool:
+        return self._add({"filename": magnet_or_url}, save_path=save_path)
+
+    def add_torrent_file(self, torrent: bytes, *, save_path: str | None = None) -> bool:
+        return self._add({"metainfo": base64.b64encode(torrent).decode("ascii")},
+                         save_path=save_path)
+
+    def _add(self, arguments: dict, *, save_path: str | None = None) -> bool:
         self.last_job_id = ""
-        arguments = {"filename": magnet_or_url}
         destination = save_path or self._config.save_path
         if destination:
             arguments["download-dir"] = destination
