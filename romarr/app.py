@@ -2897,7 +2897,8 @@ class ROMarr:
                 "forced": forced,
             })
 
-        if imported and self.store.settings.get("rescan_after_import", True):
+        if (imported and not self.store.settings.get("acquisition_only", False)
+                and self.store.settings.get("rescan_after_import", True)):
             target_lib.rescan(platform.slug)
         self.store.save()
 
@@ -3000,6 +3001,10 @@ class ROMarr:
         each import (scoped to the importing platform) and via
         ``POST /api/v1/collection/reconcile``.
         """
+        if self.store.settings.get("acquisition_only", False):
+            return {"ok": True, "platform": platform_slug, "dropped": 0,
+                    "skipped": "acquisition-only mode does not reconcile the outgoing folder"}
+
         from .library import _source_for
         from .dat import VERIFIED as _VERIFIED, hash_bytes as _hash_bytes
 
@@ -6241,7 +6246,8 @@ class ROMarr:
                 # Tasks page button clears failure marks to retry.
                 queue_item.state = "imported" if any_ok else "import-failed"
             if any_ok:
-                if self.store.settings.get("rescan_after_import", True):
+                if (not self.store.settings.get("acquisition_only", False)
+                        and self.store.settings.get("rescan_after_import", True)):
                     target_lib.rescan(platform.slug)
                 # The absolute destinations this release was imported to.
                 # Cartridge streams them back to the player; external
@@ -6274,7 +6280,8 @@ class ROMarr:
                 # that are already present and verified in the library but were
                 # never fulfilled (word-order/alias titles, pre-existing stale
                 # entries). Gated by setting so the hash walk can be disabled.
-                if self.store.settings.get("reconcile_after_import", True):
+                if (not self.store.settings.get("acquisition_only", False)
+                        and self.store.settings.get("reconcile_after_import", True)):
                     try:
                         self.reconcile_platform(platform.slug)
                     except Exception:  # noqa: BLE001

@@ -297,6 +297,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # Behaviour
     "auto_import": True,
     "rescan_after_import": True,
+    "reconcile_after_import": True,
+    # The local folder may be an outgoing spool owned by a delivery process.
+    "acquisition_only": False,
     # Scan every finished download with ClamAV before it is imported (see
     # clamav.py). The address is clamd's: tcp://host:3310, or a socket path.
     "clamav_enabled": False,
