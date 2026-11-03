@@ -482,7 +482,7 @@ def import_rom(download: Path, platform: Platform, library_root: Path, *,
                require_verified: bool = False,
                layout: str = "flat", translation: bool = False,
                rename: bool = False,
-               platform_folders=None) -> list[ImportResult]:
+               platform_folders=None, export_only: bool = False) -> list[ImportResult]:
     """Place every ROM from a finished download into the library.
 
     A cartridge zip may hold several games (a 3-in-1 collection, a bundle)
@@ -496,6 +496,10 @@ def import_rom(download: Path, platform: Platform, library_root: Path, *,
     The rename option uses verified DAT names for single-file ROMs, retaining
     the physical extension. Multi-file members keep their reference names.
     """
+    if export_only and str(layout).lower() != "flat":
+        return [ImportResult(False, None, "standalone export supports only flat library layout")]
+    if export_only and overwrite:
+        return [ImportResult(False, None, "overwriting published exports is disabled")]
     if not download.exists():
         msg = (
             f"download path does not exist in this container: {download}. "

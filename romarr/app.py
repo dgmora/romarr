@@ -736,6 +736,10 @@ class ROMarr:
                 return float(self.store.settings.get(key) or 0) * 3600
             return read
 
+        if str(e.get("ROMARR_STANDALONE_EXPORT", "")).lower() in ("1", "true", "yes"):
+            from .standalone import configure_export
+            configure_export(self.store, self.library)
+
         self.scheduler = Scheduler()
         self.scheduler.add(
             "ImportCompleted", "Import completed downloads",
@@ -2848,7 +2852,8 @@ class ROMarr:
                               rename=bool(self.store.settings.get("rename_on_import", True)),
                               layout=self.library_layout(target_cfg),
                               translation=is_translation(source.name),
-                              platform_folders=self.platform_folders(target_cfg))
+                              platform_folders=self.platform_folders(target_cfg),
+                export_only=self.store.settings.get("standalone_export", False))
 
         imported, refused = [], []
         for outcome in outcomes:
@@ -6206,7 +6211,8 @@ class ROMarr:
                 rename=bool(self.store.settings.get("rename_on_import", True)),
                 layout=self.library_layout(target_cfg),
                 translation=is_translation(name),
-                platform_folders=self.platform_folders(target_cfg))
+                platform_folders=self.platform_folders(target_cfg),
+                export_only=self.store.settings.get("standalone_export", False))
             if not outcomes:
                 self.store.record(Event(kind="failed", game=name,
                                         platform=platform.slug,
