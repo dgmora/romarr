@@ -57,7 +57,7 @@ from .dat import DatIndex, parse_dat
 from .decompress import run_batch as run_decompress_batch, scan_compressed
 from .titled import TitleDBIndex, build_index as build_titled_index, validate_switch_rom
 from .downloaders import (
-    CLIENT_TYPES, NZBGet, NzbgetConfig, SABnzbd, SabConfig, build_client,
+    AmbiguousQueueMatch, CLIENT_TYPES, NZBGet, NzbgetConfig, SABnzbd, SabConfig, build_client,
     hand_off_with_id, match_queue_item, merge_secrets, pick_client, redact,
 )
 from .indexers import INDEXER_TYPES, build_indexer, merge_indexer_secrets, redact_indexer
@@ -6121,7 +6121,18 @@ class ROMarr:
             platform = None
             queue_item = None
             with self._lock:
-                match = match_queue_item(self.queue, torrent)
+                try:
+                    match = match_queue_item(self.queue, torrent)
+                except AmbiguousQueueMatch as err:
+                    # Do not guess which requested game/platform owns a shared
+                    # torrent. Persist an actionable failure for every pending
+                    # row, leaving previous successful acquisitions untouched.
+                    for item in err.items:
+                        item.state = "import-failed"
+                        item.detail = str(err)
+                    self.store.record(Event(kind="failed", game=name, platform="", detail=str(err)))
+                    results.append({"name": name, "ok": False, "reason": str(err)})
+                    continue
                 if match is not None:
                     queue_item = match
                     if match.state not in ("imported", "import-failed"):
