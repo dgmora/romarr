@@ -439,10 +439,11 @@ def search(query: str, platform: str | None = None, limit: int = 25,
     # live, and a ReadTimeout inside the plugin surfaced as a plugin failure
     # rather than as a slow source. One timeout to reason about, not two.
     from .ia_session import archive_transport
+    from .ia_auth import status as ia_status
     # ROM Hub shares a fetcher across all plugins in a search fanout.
     # Split only when IA auth is configured, so another plugin cannot use
     # the Archive.org cookies through an otherwise allowed archive.org URL.
-    if __import__("romarr.ia_auth", fromlist=["status"]).status(HOME)["configured"]:
+    if ia_status(HOME)["configured"]:
         batches = [
             ([p for p in plugins if p.slug != "archive-org"], None),
             ([p for p in plugins if p.slug == "archive-org"], "archive-org"),
