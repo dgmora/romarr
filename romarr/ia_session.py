@@ -12,7 +12,7 @@ import httpx
 from .ia_auth import ArchiveAuthError, credentials
 
 LOGIN_URL = "https://archive.org/services/xauthn/?op=login"
-_HOST = re.compile(r"ia[0-9]+\\.(?:us|ca)\\.archive\\.org\\Z")
+_HOST = re.compile(r"ia[0-9]+\.(?:us|ca)\.archive\.org\Z")
 _COOKIE_NAMES = ("logged-in-user", "logged-in-sig")
 _LOCK = threading.Lock()
 _SESSIONS = {}
