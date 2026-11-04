@@ -443,7 +443,14 @@ def search(query: str, platform: str | None = None, limit: int = 25,
     # ROM Hub shares a fetcher across all plugins in a search fanout.
     # Split only when IA auth is configured, so another plugin cannot use
     # the Archive.org cookies through an otherwise allowed archive.org URL.
-    if ia_status(HOME)["configured"]:
+    ia = ia_status(HOME)
+    auth_error = ""
+    if ia["error"]:
+        # Never silently downgrade a configured but invalid account to
+        # anonymous access. Other plugins should still return their results.
+        auth_error = "Archive.org authentication: " + ia["error"]
+        plugins = [p for p in plugins if p.slug != "archive-org"]
+    if ia["configured"]:
         batches = [
             ([p for p in plugins if p.slug != "archive-org"], None),
             ([p for p in plugins if p.slug == "archive-org"], "archive-org"),
@@ -472,7 +479,7 @@ def search(query: str, platform: str | None = None, limit: int = 25,
                 rows.append(r.model_dump())
             except Exception:  # pragma: no cover -- pydantic model, always dumps
                 rows.append(dict(r))
-    return rows, ""
+    return rows, auth_error
 
 
 def resolve_torrents(rows: list[dict]) -> list[dict]:
