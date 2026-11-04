@@ -14,11 +14,9 @@ class ArchiveAuthTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.config = Path(self.tmp.name) / "ia.ini"
+        self.config = Path(self.tmp.name) / "archive-org-cookies.json"
         self.config.write_text(
-            "[s3]\naccess=abc\nsecret=def\n[cookies]\n"
-            "logged-in-user = test%40example.com; expires=Fri, 20 Jan 2028 12:00:00 GMT; domain=.archive.org\n"
-            "logged-in-sig = ABC%3D123; expires=Fri, 20 Jan 2028 12:00:00 GMT; domain=.archive.org\n"
+            '{"logged-in-user":"test%40example.com","logged-in-sig":"ABC%3D123"}'
         )
 
     def request(self, url):
@@ -43,25 +41,35 @@ class ArchiveAuthTests(unittest.TestCase):
         self.assertIsNone(self.request("http://archive.org/test")[1])
 
     def test_missing_login_is_no_transport(self):
-        with patch.dict(os.environ, {"ROMARR_IA_CONFIG_FILE": ""}):
+        with patch.dict(os.environ, {"ROMARR_ARCHIVE_ORG_COOKIES_FILE": ""}):
             self.assertIsNone(archive_transport("archive-org"))
-        with patch.dict(os.environ, {"ROMARR_IA_CONFIG_FILE": str(self.config)}):
+        with patch.dict(os.environ, {"ROMARR_ARCHIVE_ORG_COOKIES_FILE": str(self.config)}):
             self.assertIsNone(archive_transport("different-source"))
             transport = archive_transport("archive-org")
             self.assertIsInstance(transport, ArchiveOrgCookieTransport)
             transport.close()
 
     def test_missing_or_invalid_cookies_fail_closed_without_values(self):
-        self.config.write_text("[cookies]\nlogged-in-user=secret\n")
-        with self.assertRaisesRegex(ArchiveAuthError, "logged-in-sig"):
+        self.config.write_text('{"logged-in-user":"secret"}')
+        with self.assertRaisesRegex(ArchiveAuthError, "exactly"):
             ArchiveOrgCookieTransport(self.config)
         self.config.write_text(
-            "[cookies]\nlogged-in-user=secret\nlogged-in-sig = bad token\n"
+            '{"logged-in-user":"secret","logged-in-sig":"bad token"}'
         )
         with self.assertRaises(ArchiveAuthError) as raised:
             ArchiveOrgCookieTransport(self.config)
         self.assertNotIn("secret", str(raised.exception))
         self.assertNotIn("bad token", str(raised.exception))
+
+    def test_rejects_non_json_and_extra_fields(self):
+        self.config.write_text("[cookies]\\nlogged-in-user=secret\\n")
+        with self.assertRaises(ArchiveAuthError):
+            ArchiveOrgCookieTransport(self.config)
+        self.config.write_text(
+            '{"logged-in-user":"u","logged-in-sig":"s","s3-secret":"unsafe"}'
+        )
+        with self.assertRaisesRegex(ArchiveAuthError, "exactly"):
+            ArchiveOrgCookieTransport(self.config)
 
 
 if __name__ == "__main__":
