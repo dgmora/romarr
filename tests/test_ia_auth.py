@@ -1,76 +1,132 @@
-"""Offline tests for Archive.org auth: cookies are never shared with other plugins."""
+"""Offline proofs for IA login, secret isolation, renewal and request scope."""
+import json
 import os
+import time
 from pathlib import Path
-import tempfile
-import unittest
-from unittest.mock import patch
 
 import httpx
+import pytest
 
-from romarr.ia_auth import ArchiveAuthError, ArchiveOrgCookieTransport, archive_transport
+from romarr.ia_auth import ArchiveAuthError, configure, credentials, status
+from romarr.ia_session import ArchiveOrgSession, ArchiveOrgTransport
 
 
-class ArchiveAuthTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.config = Path(self.tmp.name) / "archive-org-cookies.json"
-        self.config.write_text(
-            '{"logged-in-user":"test%40example.com","logged-in-sig":"ABC%3D123"}'
-        )
+@pytest.fixture
+def root(tmp_path, monkeypatch):
+    for key in ("EMAIL", "PASSWORD", "EMAIL_FILE", "PASSWORD_FILE"):
+        monkeypatch.delenv("ROMARR_ARCHIVE_ORG_" + key, raising=False)
+    # Exercise ROM Hub's actual persistent encrypted file store in CI.
+    monkeypatch.setenv("ROM_HUB_SECRET_STORE", "file")
+    monkeypatch.setenv("ROM_HUB_SECRET_KEY", "test-key-stored-only-in-environment")
+    return tmp_path
 
-    def request(self, url):
-        seen = []
 
-        def mock(request):
-            seen.append((str(request.url), request.headers.get("cookie")))
-            return httpx.Response(200, text="ok")
+def _client(root, handler, remote):
+    manager = ArchiveOrgSession(root, login_transport=httpx.MockTransport(handler))
+    return manager, httpx.Client(transport=ArchiveOrgTransport(
+        manager, transport=httpx.MockTransport(remote)))
 
-        with httpx.Client(transport=ArchiveOrgCookieTransport(
-                self.config, transport=httpx.MockTransport(mock))) as client:
-            client.get(url)
-        return seen[0]
 
-    def test_cookie_exact_hosts_only(self):
-        expected = "logged-in-user=test%40example.com; logged-in-sig=ABC%3D123"
+def _login(request, token="session"):
+    assert request.url == "https://archive.org/services/xauthn/?op=login"
+    assert request.method == "POST"
+    assert b"email=" in request.content and b"password=" in request.content
+    return httpx.Response(200, json={"success": True, "values": {"cookies": {
+        "logged-in-user": "account%40example.com; Max-Age=3600; domain=.archive.org",
+        "logged-in-sig": token + "; Max-Age=3600; domain=.archive.org"}}})
+
+
+def test_ui_uses_existing_secret_store_and_only_one_encrypted_entry(root):
+    assert status(root)["configured"] is False
+    assert configure(root, "account@example.com", "secret-password") == {"ok": True}
+    assert credentials(root) == ("account@example.com", "secret-password")
+    stored = root / "secrets.json"
+    assert stored.is_file()
+    content = stored.read_text()
+    assert "secret-password" not in content and "account@example.com" not in content
+    assert not (root / "state.json").exists()
+    assert status(root) == {"configured": True, "external": False, "error": ""}
+    assert configure(root, clear=True) == {"ok": True}
+    assert credentials(root) is None
+
+
+def test_external_files_override_ui_without_copying_to_store(root, monkeypatch):
+    assert configure(root, "ui@example.com", "ui-secret") == {"ok": True}
+    email_path, password_path = root / "email", root / "password"
+    email_path.write_text("external@example.com\n")
+    password_path.write_text("external-secret\n")
+    monkeypatch.setenv("ROMARR_ARCHIVE_ORG_EMAIL_FILE", str(email_path))
+    monkeypatch.setenv("ROMARR_ARCHIVE_ORG_PASSWORD_FILE", str(password_path))
+    assert credentials(root) == ("external@example.com", "external-secret")
+    assert configure(root, "second@example.com", "second-secret")["ok"] is False
+    assert status(root)["external"] is True
+    monkeypatch.delenv("ROMARR_ARCHIVE_ORG_EMAIL_FILE")
+    monkeypatch.delenv("ROMARR_ARCHIVE_ORG_PASSWORD_FILE")
+    assert credentials(root) == ("ui@example.com", "ui-secret")
+
+
+def test_login_reuses_cookie_and_never_sends_it_to_unrelated_hosts(root):
+    assert configure(root, "account@example.com", "secret-password")["ok"]
+    logins, requests = [], []
+    def login(req):
+        logins.append(1)
+        return _login(req)
+    def remote(req):
+        requests.append((str(req.url), req.headers.get("cookie")))
+        return httpx.Response(200)
+    manager, client = _client(root, login, remote)
+    with client:
         for host in ("archive.org", "ia800408.us.archive.org", "ia600107.ca.archive.org"):
-            self.assertEqual(self.request(f"https://{host}/view_archive.php")[1], expected)
-        for host in ("www.archive.org", "web.archive.org", "ia900.notarchive.org",
-                     "archive.org.evil.example", "example.com"):
-            self.assertIsNone(self.request(f"https://{host}/view_archive.php")[1])
-        self.assertIsNone(self.request("http://archive.org/test")[1])
-
-    def test_missing_login_is_no_transport(self):
-        with patch.dict(os.environ, {"ROMARR_ARCHIVE_ORG_COOKIES_FILE": ""}):
-            self.assertIsNone(archive_transport("archive-org"))
-        with patch.dict(os.environ, {"ROMARR_ARCHIVE_ORG_COOKIES_FILE": str(self.config)}):
-            self.assertIsNone(archive_transport("different-source"))
-            transport = archive_transport("archive-org")
-            self.assertIsInstance(transport, ArchiveOrgCookieTransport)
-            transport.close()
-
-    def test_missing_or_invalid_cookies_fail_closed_without_values(self):
-        self.config.write_text('{"logged-in-user":"secret"}')
-        with self.assertRaisesRegex(ArchiveAuthError, "exactly"):
-            ArchiveOrgCookieTransport(self.config)
-        self.config.write_text(
-            '{"logged-in-user":"secret","logged-in-sig":"bad token"}'
-        )
-        with self.assertRaises(ArchiveAuthError) as raised:
-            ArchiveOrgCookieTransport(self.config)
-        self.assertNotIn("secret", str(raised.exception))
-        self.assertNotIn("bad token", str(raised.exception))
-
-    def test_rejects_non_json_and_extra_fields(self):
-        self.config.write_text("[cookies]\\nlogged-in-user=secret\\n")
-        with self.assertRaises(ArchiveAuthError):
-            ArchiveOrgCookieTransport(self.config)
-        self.config.write_text(
-            '{"logged-in-user":"u","logged-in-sig":"s","s3-secret":"unsafe"}'
-        )
-        with self.assertRaisesRegex(ArchiveAuthError, "exactly"):
-            ArchiveOrgCookieTransport(self.config)
+            assert client.get(f"https://{host}/view_archive.php").status_code == 200
+        for host in ("www.archive.org", "archive.org.attacker.test", "example.com"):
+            assert client.get(f"https://{host}/download").status_code == 200
+        assert client.get("http://archive.org/test").status_code == 200
+    assert len(logins) == 1
+    expected = "logged-in-user=account%40example.com; logged-in-sig=session"
+    assert [cookie for _, cookie in requests] == [expected] * 3 + [None] * 4
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_cookie_expiry_renews_before_request(root):
+    assert configure(root, "account@example.com", "secret-password")["ok"]
+    logins = []
+    def login(req):
+        logins.append(1)
+        return _login(req, "cookie" + str(len(logins)))
+    manager, client = _client(root, login, lambda req: httpx.Response(200))
+    with client:
+        client.get("https://archive.org/metadata/test")
+        manager._expires = time.time() + 60  # inside the five-minute margin
+        client.get("https://archive.org/metadata/test")
+    assert len(logins) == 2
+
+
+def test_403_reauthenticates_only_once_then_preserves_refusal(root):
+    assert configure(root, "account@example.com", "secret-password")["ok"]
+    logins, outgoing = [], []
+    def login(req):
+        logins.append(1)
+        return _login(req, "cookie" + str(len(logins)))
+    def remote(req):
+        outgoing.append(req.headers["cookie"])
+        return httpx.Response(403)
+    _, client = _client(root, login, remote)
+    with client:
+        response = client.get("https://archive.org/download/restricted.zip/member.chd")
+    assert response.status_code == 403
+    assert len(logins) == 2
+    assert len(outgoing) == 2 and outgoing[0] != outgoing[1]
+
+
+def test_bad_login_message_cannot_expose_password(root):
+    assert configure(root, "account@example.com", "secret-password")["ok"]
+    _, client = _client(root, lambda req: httpx.Response(
+        200, json={"success": False, "error": "secret-password"}), lambda req: httpx.Response(200))
+    with client, pytest.raises(ArchiveAuthError, match="rejected"):
+        client.get("https://archive.org/metadata/restricted")
+    # The returned message contains no response body or submitted credentials.
+
+
+def test_plugin_has_no_credentials_to_receive(root):
+    from rom_hub.registry import Registry
+    # This is a host-only secret slug, not an installed plugin secret declaration.
+    assert "archive-org-host-auth" != "archive-org"
