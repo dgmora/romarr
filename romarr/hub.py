@@ -419,21 +419,39 @@ def search(query: str, platform: str | None = None, limit: int = 25,
     # shorter than some sources need -- MiNERVA measured 21-25s per query
     # live, and a ReadTimeout inside the plugin surfaced as a plugin failure
     # rather than as a slow source. One timeout to reason about, not two.
-    fetcher = HttpxFetcher(timeout=max(60.0, timeout))
-    try:
-        outcome = search_all(plugins, fetcher=fetcher, query=query,
-                             platform=platform, limit=limit, timeout=timeout,
-                             allow_unsandboxed=_unsandboxed())
-    except Exception as exc:
-        return [], f"ROM Hub search failed: {type(exc).__name__}: {exc}"
-    finally:
-        fetcher.close()
+    from .ia_auth import archive_transport
+    # ROM Hub shares a fetcher across all plugins in a search fanout.
+    # Split only when IA auth is configured, so another plugin cannot use
+    # the Archive.org cookies through an otherwise allowed archive.org URL.
+    if os.environ.get("ROMARR_IA_CONFIG_FILE"):
+        batches = [
+            ([p for p in plugins if p.slug != "archive-org"], None),
+            ([p for p in plugins if p.slug == "archive-org"], "archive-org"),
+        ]
+    else:
+        batches = [(plugins, None)]
     rows = []
-    for r in outcome.results:
+    for group, auth_slug in batches:
+        if not group:
+            continue
         try:
-            rows.append(r.model_dump())
-        except Exception:  # pragma: no cover -- pydantic model, always dumps
-            rows.append(dict(r))
+            transport = archive_transport(auth_slug) if auth_slug else None
+            fetcher = HttpxFetcher(timeout=max(60.0, timeout), transport=transport)
+        except Exception as exc:
+            return rows, f"Archive.org authentication setup failed: {type(exc).__name__}: {exc}"
+        try:
+            outcome = search_all(group, fetcher=fetcher, query=query,
+                                 platform=platform, limit=limit, timeout=timeout,
+                                 allow_unsandboxed=_unsandboxed())
+        except Exception as exc:
+            return rows, f"ROM Hub search failed: {type(exc).__name__}: {exc}"
+        finally:
+            fetcher.close()
+        for r in outcome.results:
+            try:
+                rows.append(r.model_dump())
+            except Exception:  # pragma: no cover -- pydantic model, always dumps
+                rows.append(dict(r))
     return rows, ""
 
 
@@ -560,7 +578,13 @@ def fetch(row: dict, dest_dir) -> dict:
                 "error": f"plugin {slug!r} is disabled", "files": []}
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
-    fetcher = HttpxFetcher()
+    from .ia_auth import archive_transport
+    try:
+        fetcher = HttpxFetcher(transport=archive_transport(slug))
+    except Exception as exc:
+        return {"ok": False,
+                "error": f"Archive.org authentication setup failed: {type(exc).__name__}: {exc}",
+                "files": []}
     try:
         with PluginProcess(plugin_dir=plugin.path, manifest=plugin.manifest,
                            config=getattr(plugin, "config", {}) or {},
@@ -569,7 +593,8 @@ def fetch(row: dict, dest_dir) -> dict:
             plan = proc.plan(result)
             with HttpDownloader(
                     allowlist=list(getattr(plugin.manifest, "network", [])
-                                   or [])) as downloader:
+                                   or []),
+                    transport=archive_transport(slug)) as downloader:
                 files = []
                 for f in plan.files:
                     saved = downloader.download(f.url,
