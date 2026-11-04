@@ -17,6 +17,11 @@ existing secret store. It is intentionally **not** a plugin-declared secret,
 so ROM Hub's plugin subprocess receives neither credentials nor cookies.
 Nothing is written to ROMarr's JSON settings or ordinary plugin config.
 
+**Trust boundary:** Credentials are not passed in the plugin protocol, but
+ROM Hub's sandbox does not restrict same-user file reads. A malicious plugin
+may read files accessible to ROMarr's service account; this secret store
+prevents accidental disclosure, not malicious-plugin credential theft.
+
 On headless Linux, ROM Hub's default secret store encrypts the file with a key
 stored beside it. This prevents accidental disclosure in config/log output,
 but is **not strong at-rest protection against a filesystem reader**. For that
