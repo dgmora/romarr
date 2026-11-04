@@ -95,7 +95,7 @@ def test_cookie_expiry_renews_before_request(root):
     manager, client = _client(root, login, lambda req: httpx.Response(200))
     with client:
         client.get("https://archive.org/metadata/test")
-        manager._expires = time.time() + 60  # inside the five-minute margin
+        manager._refresh_at = time.time() - 1  # simulate an expired renewal deadline
         client.get("https://archive.org/metadata/test")
     assert len(logins) == 2
 
