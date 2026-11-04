@@ -423,7 +423,7 @@ def search(query: str, platform: str | None = None, limit: int = 25,
     # ROM Hub shares a fetcher across all plugins in a search fanout.
     # Split only when IA auth is configured, so another plugin cannot use
     # the Archive.org cookies through an otherwise allowed archive.org URL.
-    if os.environ.get("ROMARR_IA_CONFIG_FILE"):
+    if os.environ.get("ROMARR_ARCHIVE_ORG_COOKIES_FILE"):
         batches = [
             ([p for p in plugins if p.slug != "archive-org"], None),
             ([p for p in plugins if p.slug == "archive-org"], "archive-org"),
