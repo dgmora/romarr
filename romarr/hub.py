@@ -377,6 +377,25 @@ def _unsandboxed() -> bool:
     return not ok
 
 
+
+
+def archive_org_auth_status() -> dict:
+    """Expose configuration status, never credentials, to ROMarr's UI."""
+    from .ia_auth import status
+    return status(HOME)
+
+
+def archive_org_auth_configure(email="", password="", clear=False) -> dict:
+    """UI operation: store in ROM Hub's secret store, NOT in plugin config."""
+    try:
+        from rom_hub.registry import Registry
+        Registry(HOME).get("archive-org")
+    except Exception:
+        return {"ok": False, "error": "Install the Archive.org plugin first"}
+    from .ia_auth import configure
+    return configure(HOME, email=email, password=password, clear=clear)
+
+
 def searchable_plugins() -> list[str]:
     """Slugs of installed, enabled plugins that declare `search`."""
     try:
@@ -419,11 +438,11 @@ def search(query: str, platform: str | None = None, limit: int = 25,
     # shorter than some sources need -- MiNERVA measured 21-25s per query
     # live, and a ReadTimeout inside the plugin surfaced as a plugin failure
     # rather than as a slow source. One timeout to reason about, not two.
-    from .ia_auth import archive_transport
+    from .ia_session import archive_transport
     # ROM Hub shares a fetcher across all plugins in a search fanout.
     # Split only when IA auth is configured, so another plugin cannot use
     # the Archive.org cookies through an otherwise allowed archive.org URL.
-    if os.environ.get("ROMARR_ARCHIVE_ORG_COOKIES_FILE"):
+    if __import__("romarr.ia_auth", fromlist=["status"]).status(HOME)["configured"]:
         batches = [
             ([p for p in plugins if p.slug != "archive-org"], None),
             ([p for p in plugins if p.slug == "archive-org"], "archive-org"),
@@ -435,7 +454,7 @@ def search(query: str, platform: str | None = None, limit: int = 25,
         if not group:
             continue
         try:
-            transport = archive_transport(auth_slug) if auth_slug else None
+            transport = archive_transport(auth_slug, HOME) if auth_slug else None
             fetcher = HttpxFetcher(timeout=max(60.0, timeout), transport=transport)
         except Exception as exc:
             return rows, f"Archive.org authentication setup failed: {type(exc).__name__}: {exc}"
@@ -578,9 +597,9 @@ def fetch(row: dict, dest_dir) -> dict:
                 "error": f"plugin {slug!r} is disabled", "files": []}
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
-    from .ia_auth import archive_transport
+    from .ia_session import archive_transport
     try:
-        fetcher = HttpxFetcher(transport=archive_transport(slug))
+        fetcher = HttpxFetcher(transport=archive_transport(slug, HOME))
     except Exception as exc:
         return {"ok": False,
                 "error": f"Archive.org authentication setup failed: {type(exc).__name__}: {exc}",
@@ -594,7 +613,7 @@ def fetch(row: dict, dest_dir) -> dict:
             with HttpDownloader(
                     allowlist=list(getattr(plugin.manifest, "network", [])
                                    or []),
-                    transport=archive_transport(slug)) as downloader:
+                    transport=archive_transport(slug, HOME)) as downloader:
                 files = []
                 for f in plan.files:
                     saved = downloader.download(f.url,
