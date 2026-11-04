@@ -1,10 +1,10 @@
-"""Scoped Archive.org session cookies for ROMarr's ROM Hub HTTP bridge.
+"""ROMarr-owned Archive.org session authentication for ROM Hub.
 
-The plugin subprocess receives no secrets. ROM Hub's host fetcher and
-downloader both support an HTTPX transport argument; use it to attach an
-Archive.org session only to the intended HTTPS hosts.
+A dedicated JSON credential file contains only Archive.org's two session cookie
+values. ROMarr reads it host-side; ROM Hub plugins and their config never see it.
+The authenticated fetcher is never shared with other plugins.
 """
-from configparser import ConfigParser
+import json
 from pathlib import Path
 import re
 
@@ -18,37 +18,28 @@ class ArchiveAuthError(ValueError):
     """Invalid or incomplete credentials; never include secret values."""
 
 
-def _cookie_header(config_path: str | Path) -> str:
-    config = ConfigParser(interpolation=None)
-    path = Path(config_path)
+def _cookie_header(path: str | Path) -> str:
     try:
-        with path.open(encoding="utf-8") as handle:
-            config.read_file(handle)
+        with Path(path).open(encoding="utf-8") as handle:
+            data = json.load(handle)
     except (OSError, UnicodeError, ValueError) as exc:
-        raise ArchiveAuthError("cannot read Archive.org authentication config") from exc
-    if not config.has_section("cookies"):
-        raise ArchiveAuthError("Archive.org config has no [cookies] section")
+        raise ArchiveAuthError("cannot read Archive.org cookie JSON secret") from exc
+
+    if not isinstance(data, dict) or set(data) != set(_COOKIE_NAMES):
+        raise ArchiveAuthError("Archive.org cookie secret must contain exactly "
+                               "logged-in-user and logged-in-sig")
     parts = []
     for name in _COOKIE_NAMES:
-        raw = config.get("cookies", name, fallback="").strip()
-        # internetarchive's ia.ini saves a Set-Cookie string; the first
-        # portion is the cookie value, followed by domain/expiry attributes.
-        token = raw.partition(";")[0].strip()
-        if token.startswith(name + "="):
-            token = token[len(name) + 1:]
-        if not token or any(ch in token for ch in "\r\n; "):
+        value = data[name]
+        if (not isinstance(value, str) or not value or
+                any(c in value for c in "\r\n; \t")):
             raise ArchiveAuthError(f"missing or invalid {name} cookie")
-        parts.append(f"{name}={token}")
+        parts.append(f"{name}={value}")
     return "; ".join(parts)
 
 
 class ArchiveOrgCookieTransport(httpx.BaseTransport):
-    """Attach IA cookies to explicitly permitted Archive.org HTTPS hosts.
-
-    This is not a global HTTPX cookie jar: ROM Hub's search dispatcher
-    shares its fetcher across plugins. Only call this transport for the
-    archive-org plugin, with anonymous transport for all other plugins.
-    """
+    """Attach Archive.org cookies only to approved HTTPS hostnames."""
 
     def __init__(self, config_path: str | Path,
                  transport: httpx.BaseTransport | None = None):
@@ -67,7 +58,7 @@ class ArchiveOrgCookieTransport(httpx.BaseTransport):
 
 
 def archive_transport(plugin_slug: str):
-    """Opt-in credentials only for the Archive.org plugin."""
+    """Opt-in only for the archive-org plugin, not the shared ROM Hub fanout."""
     import os
-    path = os.environ.get("ROMARR_IA_CONFIG_FILE", "")
+    path = os.environ.get("ROMARR_ARCHIVE_ORG_COOKIES_FILE", "")
     return ArchiveOrgCookieTransport(path) if path and plugin_slug == "archive-org" else None
