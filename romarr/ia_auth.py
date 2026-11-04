@@ -1,64 +1,90 @@
-"""ROMarr-owned Archive.org session authentication for ROM Hub.
+"""Persistent IA credentials for ROMarr's host-side HTTP transport.
 
-A dedicated JSON credential file contains only Archive.org's two session cookie
-values. ROMarr reads it host-side; ROM Hub plugins and their config never see it.
-The authenticated fetcher is never shared with other plugins.
+UI credentials live in ROM Hub's existing secret store under a *host-only*
+slug, never under an installed plugin slug. External files/env take precedence
+and are never copied into the store. No cookies are persisted.
 """
 import json
+import os
 from pathlib import Path
-import re
 
-import httpx
-
-_STORAGE_HOST = re.compile(r"ia[0-9]+\.(?:us|ca)\.archive\.org\Z")
-_COOKIE_NAMES = ("logged-in-user", "logged-in-sig")
+STORE_SLUG = "archive-org-host-auth"
 
 
-class ArchiveAuthError(ValueError):
-    """Invalid or incomplete credentials; never include secret values."""
+class ArchiveAuthError(RuntimeError):
+    """Errors must never contain a password or response body."""
 
 
-def _cookie_header(path: str | Path) -> str:
+def _external() -> bool:
+    return any(os.environ.get("ROMARR_ARCHIVE_ORG_" + suffix) for suffix in (
+        "EMAIL_FILE", "PASSWORD_FILE", "EMAIL", "PASSWORD"))
+
+
+def _read_external(name: str) -> str:
+    path = os.environ.get("ROMARR_ARCHIVE_ORG_" + name + "_FILE")
+    if path:
+        try:
+            return Path(path).read_text(encoding="utf-8").rstrip("\r\n")
+        except (OSError, UnicodeError):
+            raise ArchiveAuthError("Could not read Archive.org " + name.lower() + " file") from None
+    return os.environ.get("ROMARR_ARCHIVE_ORG_" + name, "")
+
+
+def _store(root: Path):
+    from rom_hub.secrets import open_store
+    return open_store(root)
+
+
+def credentials(root: Path) -> tuple[str, str] | None:
+    if _external():
+        email, password = _read_external("EMAIL"), _read_external("PASSWORD")
+    else:
+        try:
+            value = _store(root).get(STORE_SLUG, "credentials")
+            if not value:
+                return None
+            data = json.loads(value)
+            email, password = data["email"], data["password"]
+        except Exception:
+            raise ArchiveAuthError("Could not read Archive.org credentials") from None
+    if not email and not password:
+        return None
+    if (not isinstance(email, str) or not isinstance(password, str)
+            or not email or not password or len(email) > 320
+            or len(password) > 4096 or "\r" in email or "\n" in email):
+        raise ArchiveAuthError("Archive.org email and password must both be configured")
+    return email, password
+
+
+def status(root: Path) -> dict:
     try:
-        with Path(path).open(encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, UnicodeError, ValueError) as exc:
-        raise ArchiveAuthError("cannot read Archive.org cookie JSON secret") from exc
-
-    if not isinstance(data, dict) or set(data) != set(_COOKIE_NAMES):
-        raise ArchiveAuthError("Archive.org cookie secret must contain exactly "
-                               "logged-in-user and logged-in-sig")
-    parts = []
-    for name in _COOKIE_NAMES:
-        value = data[name]
-        if (not isinstance(value, str) or not value or
-                any(c in value for c in "\r\n; \t")):
-            raise ArchiveAuthError(f"missing or invalid {name} cookie")
-        parts.append(f"{name}={value}")
-    return "; ".join(parts)
+        configured = credentials(root) is not None
+        error = ""
+    except ArchiveAuthError as exc:
+        configured, error = False, str(exc)
+    return {"configured": configured, "external": _external(), "error": error}
 
 
-class ArchiveOrgCookieTransport(httpx.BaseTransport):
-    """Attach Archive.org cookies only to approved HTTPS hostnames."""
-
-    def __init__(self, config_path: str | Path,
-                 transport: httpx.BaseTransport | None = None):
-        self._cookie = _cookie_header(config_path)
-        self._delegate = transport if transport is not None else httpx.HTTPTransport()
-
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
-        host = (request.url.host or "").lower().rstrip(".")
-        if (request.url.scheme == "https" and
-                (host == "archive.org" or _STORAGE_HOST.fullmatch(host))):
-            request.headers["cookie"] = self._cookie
-        return self._delegate.handle_request(request)
-
-    def close(self) -> None:
-        self._delegate.close()
-
-
-def archive_transport(plugin_slug: str):
-    """Opt-in only for the archive-org plugin, not the shared ROM Hub fanout."""
-    import os
-    path = os.environ.get("ROMARR_ARCHIVE_ORG_COOKIES_FILE", "")
-    return ArchiveOrgCookieTransport(path) if path and plugin_slug == "archive-org" else None
+def configure(root: Path, email="", password="", clear=False) -> dict:
+    if _external():
+        return {"ok": False, "error": "External credentials override UI settings"}
+    if not isinstance(clear, bool):
+        return {"ok": False, "error": "Invalid clear flag"}
+    if not clear and (not isinstance(email, str) or not isinstance(password, str)
+                      or not email or "@" not in email or len(email) > 320
+                      or "\r" in email or "\n" in email
+                      or not password or len(password) > 4096):
+        return {"ok": False, "error": "Valid email and password are required"}
+    try:
+        store = _store(root)
+        if clear:
+            store.delete(STORE_SLUG, "credentials")
+        else:
+            # One atomic secret-store write, unlike two independent fields.
+            store.set(STORE_SLUG, "credentials",
+                      json.dumps({"email": email, "password": password}))
+        from .ia_session import invalidate
+        invalidate(root)
+        return {"ok": True}
+    except Exception:
+        return {"ok": False, "error": "Could not update Archive.org credentials"}
