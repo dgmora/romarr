@@ -53,11 +53,12 @@ class ArchiveOrgSession:
         self._lock = threading.RLock()
         self._header = None
         self._expires = None
+        self._refresh_at = None
         self._login_transport = login_transport
 
     def invalidate(self):
         with self._lock:
-            self._header = self._expires = None
+            self._header = self._expires = self._refresh_at = None
 
     def _login(self):
         pair = credentials(self.root)
@@ -71,7 +72,7 @@ class ArchiveOrgSession:
                 if response.status_code != 200 or len(response.content) > 131072:
                     raise ArchiveAuthError("Archive.org login request failed")
                 data = response.json()
-            if data.get("success") is not True:
+            if not data.get("success"):
                 raise ArchiveAuthError("Archive.org rejected the configured login")
             raw = data["values"]["cookies"]
             parsed = [_cookie(key, raw[key]) for key in _COOKIE_NAMES]
@@ -84,11 +85,17 @@ class ArchiveOrgSession:
             key + "=" + value for key, (value, _) in zip(_COOKIE_NAMES, parsed))
         expirations = [expiry for _, expiry in parsed if expiry is not None]
         self._expires = min(expirations) if expirations else None
+        if self._expires is not None:
+            remaining = max(0, self._expires - time.time())
+            # Avoid a login loop for a cookie with less than five minutes TTL.
+            self._refresh_at = self._expires - min(300, remaining * 0.1)
+        else:
+            self._refresh_at = None
 
     def header(self):
         with self._lock:
             if (self._header is None or
-                (self._expires is not None and time.time() >= self._expires - 300)):
+                (self._refresh_at is not None and time.time() >= self._refresh_at)):
                 self._login()
             return self._header
 
