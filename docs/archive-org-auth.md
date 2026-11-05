@@ -1,7 +1,7 @@
 # Archive.org authentication (ROM Hub)
 
-Archive.org login belongs to **ROMarr's host-side HTTP bridge**, not to the
-sandboxed Archive.org plugin. A plugin asks for Archive.org URLs using
+Archive.org login belongs to **ROM Hub's shared host-side implementation**, used
+by ROMarr and the standalone CLI. A plugin asks for Archive.org URLs using
 `ctx.http.get()`, or returns a `FetchPlan`; ROMarr authenticates and
 streams the requests using the same process-local session.
 
@@ -34,11 +34,11 @@ The following optional settings override the UI store **without importing
 anything into it**:
 
 ```
-ROMARR_ARCHIVE_ORG_EMAIL_FILE=/run/credentials/romarr.service/archive-org-email
-ROMARR_ARCHIVE_ORG_PASSWORD_FILE=/run/credentials/romarr.service/archive-org-password
+ROM_HUB_ARCHIVE_ORG_EMAIL_FILE=/run/credentials/romarr.service/archive-org-email
+ROM_HUB_ARCHIVE_ORG_PASSWORD_FILE=/run/credentials/romarr.service/archive-org-password
 ```
 
-`ROMARR_ARCHIVE_ORG_EMAIL` and `ROMARR_ARCHIVE_ORG_PASSWORD` are also
+`ROM_HUB_ARCHIVE_ORG_EMAIL` and `ROM_HUB_ARCHIVE_ORG_PASSWORD` are also
 supported for non-file environments, but put sensitive strings into process
 environment. File variants take precedence on a per-field basis. If external
 authentication is partially configured, ROMarr reports an error rather than
@@ -46,13 +46,13 @@ mixing it with UI credentials. Do not embed passwords in the Nix store.
 
 ## Session lifecycle
 
-- On the first authenticated request, ROMarr POSTs email/password to IA's
+- On the first authenticated request, ROM Hub POSTs email/password to IA's
   `https://archive.org/services/xauthn/?op=login` endpoint.
 - It extracts the official `logged-in-user` and `logged-in-sig` cookies,
   then keeps only the cookies in **process memory**.
 - Requests over HTTPS to `archive.org` and numbered IA storage servers
   receive the cookies, and no other plugin shares that authenticated client.
-- ROMarr renews before a known cookie expiry, or after the first 401/403,
+- ROM Hub renews before a known cookie expiry, or after the first 401/403,
   retrying the request **once**. A second refusal is passed through.
 - On UI updates or restart, the in-memory session is discarded; cookies are
   never persisted to disk. Password/email are retained by the configured
@@ -67,3 +67,33 @@ the actual ZIP listing and download URLs.
 Offline tests cover login, cookie host scoping, renewal, one-time failure
 retries, persistent UI credentials, and external file override. A live
 authenticated ZIP-member download has not yet been verified.
+
+
+The legacy `ROMARR_ARCHIVE_ORG_*` variables remain supported. Any
+`ROM_HUB_ARCHIVE_ORG_*` variable selects the new family exclusively; partial
+families are rejected. Existing saved credentials are read without migration.
+The UI and its configured/external/error status contract are unchanged.
+
+## Standalone CLI
+
+No ROMarr service is required. In the CLI virtual environment:
+
+```sh
+rom-hub auth login archive-org
+rom-hub auth status archive-org
+rom-hub search "Final Fantasy VIII" --platform psx --live
+rom-hub census build archive-org --units --verbose
+rom-hub census report archive-org --units
+rom-hub search "Final Fantasy VIII" --platform psx
+```
+
+Use the same `ROM_HUB_HOME` and store settings for all commands. David's CLI
+home and ROMarr's service home are separate unless explicitly configured to
+share one. `rom-hub auth logout archive-org` clears the CLI home's saved record;
+it refuses when externally managed credentials override that record.
+
+ROMarr continues to search plugins live and download their selected plan. It
+does not read the CLI census. The CLI can use the census for search, then obtains
+a fresh authenticated plan and payload during import. A census build reads
+metadata/listings only; retries may enumerate collection units again. Login
+success does not guarantee access to a particular ZIP listing or payload.
