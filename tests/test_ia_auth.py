@@ -14,7 +14,8 @@ from romarr.ia_session import ArchiveOrgSession, ArchiveOrgTransport
 @pytest.fixture
 def root(tmp_path, monkeypatch):
     for key in ("EMAIL", "PASSWORD", "EMAIL_FILE", "PASSWORD_FILE"):
-        monkeypatch.delenv("ROMARR_ARCHIVE_ORG_" + key, raising=False)
+        for prefix in ("ROMARR_ARCHIVE_ORG_", "ROM_HUB_ARCHIVE_ORG_"):
+            monkeypatch.delenv(prefix + key, raising=False)
     # Exercise ROM Hub's actual persistent encrypted file store in CI.
     monkeypatch.setenv("ROM_HUB_SECRET_STORE", "file")
     monkeypatch.setenv("ROM_HUB_SECRET_KEY", "test-key-stored-only-in-environment")
@@ -126,7 +127,23 @@ def test_bad_login_message_cannot_expose_password(root):
     # The returned message contains no response body or submitted credentials.
 
 
-def test_plugin_has_no_credentials_to_receive(root):
-    from rom_hub.registry import Registry
-    # This is a host-only secret slug, not an installed plugin secret declaration.
-    assert "archive-org-host-auth" != "archive-org"
+def test_romarr_uses_rom_hub_authentication():
+    import romarr.ia_auth as adapter
+    import romarr.ia_session as session_adapter
+    import rom_hub.ia_auth as shared
+    import rom_hub.ia_session as shared_session
+    assert adapter.configure is shared.configure
+    assert adapter.credentials is shared.credentials
+    assert session_adapter.archive_transport is shared_session.archive_transport
+    assert session_adapter.ArchiveOrgSession is shared_session.ArchiveOrgSession
+
+
+def test_romarr_auth_settings_use_shared_store(root, monkeypatch):
+    from romarr import hub
+    monkeypatch.setattr(hub, "HOME", root)
+    monkeypatch.setattr("rom_hub.registry.Registry.get", lambda self, slug: object())
+    assert hub.archive_org_auth_configure("account@example.com", "secret-password")["ok"]
+    assert hub.archive_org_auth_status() == {"configured": True, "external": False, "error": ""}
+    assert credentials(root) == ("account@example.com", "secret-password")
+    assert hub.archive_org_auth_configure(clear=True)["ok"]
+    assert hub.archive_org_auth_status()["configured"] is False
