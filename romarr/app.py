@@ -57,7 +57,8 @@ from .dat import DatIndex, parse_dat
 from .decompress import run_batch as run_decompress_batch, scan_compressed
 from .titled import TitleDBIndex, build_index as build_titled_index, validate_switch_rom
 from .downloaders import (
-    CLIENT_TYPES, NZBGet, NzbgetConfig, SABnzbd, SabConfig, build_client,
+    AmbiguousQueueMatch, CLIENT_TYPES, NZBGet, NzbgetConfig, SABnzbd, SabConfig,
+    Transmission, build_client,
     hand_off_with_id, match_queue_item, merge_secrets, pick_client, redact,
 )
 from .indexers import INDEXER_TYPES, build_indexer, merge_indexer_secrets, redact_indexer
@@ -735,6 +736,11 @@ class ROMarr:
             def read() -> float:
                 return float(self.store.settings.get(key) or 0) * 3600
             return read
+
+        if str(e.get("ROMARR_STANDALONE_EXPORT", "")).lower() in ("1", "true", "yes"):
+            from .standalone import configure_export
+            configure_export(self.store, self.library)
+            self.reload_libraries()
 
         self.scheduler = Scheduler()
         self.scheduler.add(
@@ -1956,11 +1962,8 @@ class ROMarr:
             if not ok:
                 failure_detail = (client.last_error or
                                   "qBittorrent could not select the exact file")
-        elif (isinstance(client, QBittorrent) and callable(local_fetch)
+        elif ((isinstance(client, QBittorrent) or type(client) is Transmission) and callable(local_fetch)
                 and local_fetch(pick.download_url)):
-            # Prowlarr's authenticated URL is LAN-only and contains its API
-            # key. Fetch it here, then upload only the .torrent bytes to the
-            # download client; never give qBittorrent that URL.
             try:
                 torrent = self.prowlarr.fetch_torrent(pick.download_url)
             except ProwlarrDownloadError as err:
@@ -1968,9 +1971,6 @@ class ROMarr:
                 release_fault = False
                 failure_detail = str(err)
             else:
-                # Prowlarr may answer a .torrent request with a terminal magnet
-                # redirect. Keep the safe local fetch path, then pass that URI
-                # to qBittorrent instead of treating it as torrent bytes.
                 if isinstance(torrent, str):
                     ok = client.add(torrent)
                 else:
@@ -1979,7 +1979,7 @@ class ROMarr:
                 release_fault = False
                 if not ok:
                     failure_detail = (
-                        "qBittorrent did not confirm the uploaded torrent")
+                        f"{client.name} did not confirm the uploaded torrent")
         else:
             ok, download_id = hand_off_with_id(client, pick.download_url,
                                                name=pick.title)
@@ -2848,7 +2848,8 @@ class ROMarr:
                               rename=bool(self.store.settings.get("rename_on_import", True)),
                               layout=self.library_layout(target_cfg),
                               translation=is_translation(source.name),
-                              platform_folders=self.platform_folders(target_cfg))
+                              platform_folders=self.platform_folders(target_cfg),
+                              export_only=self.store.settings.get("standalone_export", False))
 
         imported, refused = [], []
         for outcome in outcomes:
@@ -2897,7 +2898,8 @@ class ROMarr:
                 "forced": forced,
             })
 
-        if imported and self.store.settings.get("rescan_after_import", True):
+        if (imported and not self.store.settings.get("acquisition_only", False)
+                and self.store.settings.get("rescan_after_import", True)):
             target_lib.rescan(platform.slug)
         self.store.save()
 
@@ -3000,6 +3002,10 @@ class ROMarr:
         each import (scoped to the importing platform) and via
         ``POST /api/v1/collection/reconcile``.
         """
+        if self.store.settings.get("acquisition_only", False):
+            return {"ok": True, "platform": platform_slug, "dropped": 0,
+                    "skipped": "acquisition-only mode does not reconcile the outgoing folder"}
+
         from .library import _source_for
         from .dat import VERIFIED as _VERIFIED, hash_bytes as _hash_bytes
 
@@ -6105,6 +6111,7 @@ class ROMarr:
                 for item in self.queue:
                     if item.state == "import-failed":
                         item.state = "grabbed"
+                        item.detail = ""
             self.store.save()
         results = []
         finished = []
@@ -6121,7 +6128,16 @@ class ROMarr:
             platform = None
             queue_item = None
             with self._lock:
-                match = match_queue_item(self.queue, torrent)
+                try:
+                    match = match_queue_item(self.queue, torrent)
+                except AmbiguousQueueMatch as err:
+                    # A shared torrent cannot be assigned safely to one pending request.
+                    for item in err.items:
+                        item.state = "import-failed"
+                        item.detail = str(err)
+                    self.store.record(Event(kind="failed", game=name, platform="", detail=str(err)))
+                    results.append({"name": name, "ok": False, "reason": str(err)})
+                    continue
                 if match is not None:
                     queue_item = match
                     if match.state not in ("imported", "import-failed"):
@@ -6196,6 +6212,7 @@ class ROMarr:
                 results.append({"name": name, "ok": False, "reason": detail})
                 if queue_item is not None:
                     queue_item.state = "import-failed"
+                    queue_item.detail = detail
                 continue
             target_cfg, target_lib = target
             label = target_cfg.get("name") or getattr(target_lib, "name", "library")
@@ -6206,7 +6223,8 @@ class ROMarr:
                 rename=bool(self.store.settings.get("rename_on_import", True)),
                 layout=self.library_layout(target_cfg),
                 translation=is_translation(name),
-                platform_folders=self.platform_folders(target_cfg))
+                platform_folders=self.platform_folders(target_cfg),
+                export_only=self.store.settings.get("standalone_export", False))
             if not outcomes:
                 self.store.record(Event(kind="failed", game=name,
                                         platform=platform.slug,
@@ -6240,8 +6258,10 @@ class ROMarr:
                 # Marked so the scheduled sweep never re-attempts it; the
                 # Tasks page button clears failure marks to retry.
                 queue_item.state = "imported" if any_ok else "import-failed"
+                queue_item.detail = "" if any_ok else str(outcomes[0].reason)
             if any_ok:
-                if self.store.settings.get("rescan_after_import", True):
+                if (not self.store.settings.get("acquisition_only", False)
+                        and self.store.settings.get("rescan_after_import", True)):
                     target_lib.rescan(platform.slug)
                 # The absolute destinations this release was imported to.
                 # Cartridge streams them back to the player; external
@@ -6274,7 +6294,8 @@ class ROMarr:
                 # that are already present and verified in the library but were
                 # never fulfilled (word-order/alias titles, pre-existing stale
                 # entries). Gated by setting so the hash walk can be disabled.
-                if self.store.settings.get("reconcile_after_import", True):
+                if (not self.store.settings.get("acquisition_only", False)
+                        and self.store.settings.get("reconcile_after_import", True)):
                     try:
                         self.reconcile_platform(platform.slug)
                     except Exception:  # noqa: BLE001
