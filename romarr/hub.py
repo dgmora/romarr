@@ -381,7 +381,11 @@ def _unsandboxed() -> bool:
 
 def archive_org_auth_status() -> dict:
     """Expose configuration status, never credentials, to ROMarr's UI."""
-    from .ia_auth import status
+    try:
+        from .ia_auth import status
+    except ImportError:
+        return {"configured": False, "external": False,
+                "error": "Install the pinned ROM Hub version for Archive.org authentication"}
     return status(HOME)
 
 
