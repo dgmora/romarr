@@ -86,7 +86,7 @@ def test_the_sweep_fetches_through_the_plugin_and_reports_the_file(tmp_path):
     client.add(hub.encode_result(ROW), name="Super Metroid (USA)")
     done = client.completed()
     assert fetched and fetched[0][0] == ROW
-    assert done == [{"name": "Super Metroid (USA)",
+    assert done == [{"id": client.last_job_id, "name": "Super Metroid (USA)",
                      "content_path": str(tmp_path / "Super Metroid (USA).sfc"),
                      "save_path": str(tmp_path),
                      "state": "done"}]

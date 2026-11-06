@@ -2824,10 +2824,10 @@ RENDER.queue=async()=>{
     <th>Platform</th><th>Release</th><th>Seeders</th><th>State</th><th></th></tr></thead><tbody>
     ${d.items.map((i,n)=>`<tr><td>${esc(i.game)}</td><td>${esc(i.platform)}</td>
       <td>${esc(i.release||'—')}</td><td>${i.seeders||'—'}</td>
-      <td><span class="pill ${esc(i.state)}">${esc(i.state)}</span>
+      <td><span class="pill ${esc(i.state)}">${esc(i.state==='failed'?'Failed':i.state)}</span>
       ${i.detail?`<div style="color:var(--dim);font-size:11.5px">${esc(i.detail)}</div>`:''}
       </td><td style="text-align:right"><div class="rowact">
-        ${i.state==='failed'?`<button data-qretry="${n}">Retry</button>`:''}
+        ${i.state==='failed'?`<button data-qretry="${n}">${i.hub?'Search again':'Retry'}</button>`:''}
         <button data-qremove="${n}">Remove</button></div></td></tr>`).join('')}
       </tbody></table>`
     :'<div class="empty">Queue is empty. Requests in flight show up here.</div>');
@@ -2841,15 +2841,21 @@ RENDER.queue=async()=>{
   };
   const cf=$('#q-clearfail');
   if(cf) cf.onclick=async()=>{
-    await j('/api/v1/queue/clear',{method:'POST',
+    const r=await j('/api/v1/queue/clear',{method:'POST',
       headers:{'content-type':'application/json'},
       body:JSON.stringify({state:'failed'})});
-    go('queue'); refreshCounts();
+    await RENDER.queue(); refreshCounts();
+    if(r.errors?.length){
+      const errors=document.createElement('div'); errors.className='card'; errors.setAttribute('role','alert');
+      errors.textContent=r.errors.map(e=>`${e.game}: ${e.error}`).join(' · ');
+      $('#page').prepend(errors);
+    }
   };
   const act=async(index,action)=>{
     const r=await j('/api/v1/queue/action',{method:'POST',
       headers:{'content-type':'application/json'},
-      body:JSON.stringify({index:Number(index),action})});
+      body:JSON.stringify({index:Number(index),action,identity:Object.fromEntries(
+        ['at','download_id','download_client','release'].map(k=>[k,d.items[Number(index)][k]]))})});
     toast(r.error||(action==='retry'?(r.ok?'Grabbed':'Still no luck'):'Removed'));
     go('queue'); refreshCounts();
   };

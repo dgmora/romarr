@@ -147,6 +147,9 @@ class QueueItem:
     # existed; those never match a reported failure and wait for the stall
     # timeout.
     download_client: str = ""
+    download_protocol: str = ""
+    hub_acceptance: str = ""
+    hub_failure_recorded: bool = False
 
 
 @dataclass

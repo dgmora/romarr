@@ -10,6 +10,9 @@ TESTS = [
     "test_every_client.py", "test_reconcile_sweep.py",
     "test_transmission_completion.py", "test_pending_queue_matching.py",
     "test_atomic_publication.py", "test_acquisition_only.py",
+    "test_hub_acquisition.py", "test_hub_failure_visibility.py",
+    "test_hub_queue_ui.py", "test_sabnzbd_failed_jobs.py",
+    "test_failed_download_handling.py", "test_hub_torrent_handoff.py",
     "test_standalone_export.py", "test_delivery.py", "test_ia_auth.py",
 ]
 
