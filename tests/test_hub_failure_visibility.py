@@ -84,12 +84,38 @@ def test_legacy_matching_and_actions(tmp_path, match):
         assert q.download_id and q.detail == "metadata HTTP 503"
         assert len(failures(s)) == 1
     else:
-        assert "repair" in q.detail
+        assert ("More than one Hub download" if match == "ambiguous"
+                else "Could not match this queue item") in q.detail
         before = c._read()
         for action in ("retry", "remove"):
             assert not s.queue_action(0, action, identity(q))["ok"]
         assert c._read() == before
         assert s.queue == [q]
+
+
+@pytest.mark.parametrize("size", [None, 0])
+def test_legacy_unknown_size_matches_queue(tmp_path, size):
+    s, c = setup(tmp_path)
+    q = grab(s)
+    q.download_id = ""
+    q.release_id = "hub:archive-org|crash bandicoot 2|0"
+    rows = c._read()
+    rows[0].pop("id")
+    rows[0].update(url=hub.encode_result({**ROW, "size_bytes": size}),
+                   state="failed", detail="metadata HTTP 503")
+    c._write(rows)
+    s.import_finished(retry_failed=False)
+    assert q.download_id and q.detail == "metadata HTTP 503"
+
+
+def test_legacy_different_size_does_not_match(tmp_path):
+    s, c = setup(tmp_path)
+    q = grab(s)
+    q.download_id = ""
+    q.release_id = "hub:archive-org|crash bandicoot 2|0"
+    s.import_finished(retry_failed=False)
+    assert not q.download_id
+    assert "Could not match this queue item" in q.detail
 
 
 def test_concurrent_handoffs_are_thread_local_and_reuse_pending_id(tmp_path):
@@ -234,7 +260,7 @@ def test_mixed_clear_retains_each_refusal(tmp_path, monkeypatch):
     result = s.clear_queue("failed")
     assert result["removed"] == 1 and len(result["errors"]) == 2
     assert {q.game for q in s.queue} == {"B", "C"}
-    assert "disk full" in str(result) and "repair" in str(result)
+    assert "disk full" in str(result) and "Could not match this queue item" in str(result)
 
 
 def test_search_again_preserves_link_and_replacement_updates(tmp_path, monkeypatch):

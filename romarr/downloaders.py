@@ -3312,13 +3312,16 @@ class HubDownloader:
                         continue
                     result = hub.decode_result(row.get("url", ""))
                     identity = (f"hub:{result.get('plugin', '')}|{row.get('name', '')}|"
-                                f"{result.get('size_bytes', 0)}").lower()
+                                f"{int(result.get('size_bytes') or 0)}").lower()
                     if not item.release_id or item.release_id == identity:
                         matches.append(row)
-            if (len(matches) != 1 or matches[0].get("state") == "dismissed"
+            if len(matches) > 1:
+                raise ValueError("More than one Hub download matches this queue item; "
+                                 "ROMarr cannot safely choose one")
+            if (not matches or matches[0].get("state") == "dismissed"
                     or matches[0].get("name") != item.release):
-                raise ValueError("Hub job identity is missing or ambiguous; stop ROMarr, "
-                                 "back up its store and ledger, and repair download_id")
+                raise ValueError("Could not match this queue item to its Hub download; "
+                                 "the download may be missing or its details may have changed")
             return dict(matches[0])
 
     def dismiss(self, item) -> None:
