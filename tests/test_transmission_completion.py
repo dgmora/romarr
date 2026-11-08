@@ -59,3 +59,25 @@ def test_concurrent_submissions_keep_their_own_identity():
         return c.last_job_id
     with ThreadPoolExecutor(max_workers=2) as pool:
         assert list(pool.map(submit, ["a" * 40, "b" * 40])) == ["a" * 40, "b" * 40]
+
+
+def test_transmission_file_stats_are_normalized_and_selections_are_explicit():
+    c = client()
+    c._call = Mock(return_value={"result": "success", "arguments": {"torrents": [{
+        "hashString": HASH,
+        "files": [{"name": "Set/A.bin", "length": 100}, {"name": "Set/B.bin", "length": 200}],
+        "fileStats": [{"bytesCompleted": 100, "wanted": True, "priority": -1},
+                      {"bytesCompleted": 50, "wanted": False, "priority": 1}]}]}})
+    assert c.torrent_files(HASH) == [
+        {"index": 0, "name": "Set/A.bin", "size": 100, "progress": 1.0, "priority": 2},
+        {"index": 1, "name": "Set/B.bin", "size": 200, "progress": 0.25, "priority": 0}]
+    c._call.return_value = {"result": "success"}
+    assert c.set_file_priorities(HASH, {0: 2, 1: 0})
+    assert c._call.call_args.args == ("torrent-set", {"ids": [HASH], "files-unwanted": [1],
+                                                       "priority-low": [0], "files-wanted": [0]})
+
+
+def test_transmission_rejects_unrepresentable_priority():
+    c = client()
+    with pytest.raises(ValueError, match="cannot represent"):
+        c.set_file_priorities(HASH, {0: 7})

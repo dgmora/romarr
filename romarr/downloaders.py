@@ -618,6 +618,40 @@ class Transmission:
         return True
 
 
+    def torrent_files(self, torrent_hash: str) -> list[dict]:
+        body = self._call("torrent-get", {"ids": [torrent_hash],
+                          "fields": ["hashString", "files", "fileStats"]})
+        rows = body.get("arguments", {}).get("torrents", [])
+        if (body.get("result") != "success" or len(rows) != 1
+                or str(rows[0].get("hashString") or "").lower() != torrent_hash.lower()):
+            raise RuntimeError("Transmission could not read the torrent files")
+        files, stats = rows[0].get("files"), rows[0].get("fileStats")
+        if not isinstance(files, list) or not isinstance(stats, list) or len(files) != len(stats):
+            raise RuntimeError("Transmission returned an invalid torrent file list")
+        out = []
+        for index, (item, stat) in enumerate(zip(files, stats)):
+            size = int(item["length"])
+            completed = int(stat["bytesCompleted"])
+            priority = {-1: 2, 0: 1, 1: 6}[int(stat["priority"])] if stat["wanted"] else 0
+            out.append({"index": index, "name": item["name"], "size": size,
+                        "progress": completed / size if size else 1.0,
+                        "priority": priority})
+        return out
+
+    def set_file_priorities(self, torrent_hash: str, priorities: dict[int, int]) -> bool:
+        values = {0: "files-unwanted", 1: "priority-normal", 2: "priority-low", 6: "priority-high"}
+        if any(value not in values for value in priorities.values()):
+            raise ValueError("Transmission cannot represent the requested file priority")
+        args = {"ids": [torrent_hash]}
+        for value, key in values.items():
+            indexes = [index for index, priority in priorities.items() if priority == value]
+            if indexes:
+                args[key] = indexes
+        wanted = [index for index, priority in priorities.items() if priority != 0]
+        if wanted:
+            args["files-wanted"] = wanted
+        return self._call("torrent-set", args).get("result") == "success"
+
     def completed(self) -> list[dict]:
         body = self._call("torrent-get", {"fields": [
             "name", "hashString", "downloadDir", "labels",
