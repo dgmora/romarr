@@ -3541,10 +3541,10 @@ def match_queue_item(queue, download: dict):
 
     found = str(download.get("hash") or "").strip().lower()
     job = str(download.get("id") or "").strip()
-    if found or job:
-        matches = [item for item in queue
-                   if (found and item.release_id == f"btih:{found}")
-                   or (job and item.download_id == job)]
+    for matches in (
+        [item for item in queue if job and item.download_id == job],
+        [item for item in queue if found and item.release_id == f"btih:{found}"],
+    ):
         pending = [item for item in matches if item.state == "grabbed"]
         if len(pending) > 1:
             raise AmbiguousQueueMatch(pending)

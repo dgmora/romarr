@@ -119,3 +119,11 @@ def test_completion_does_not_claim_another_clients_legacy_title():
     item.download_id = item.release_id = ""
     client = type("Client", (), {"romarr_id": "second"})()
     assert match_queue_item([item], {"name": item.release, "_romarr_client": client}) is None
+
+
+def test_request_identity_takes_precedence_over_shared_release_hash():
+    first = row("A", "grabbed")
+    second = row("B", "grabbed")
+    first.download_id = "request-a"
+    second.download_id = "request-b"
+    assert match_queue_item([first, second], {"hash": HASH, "id": "request-b"}) is second
