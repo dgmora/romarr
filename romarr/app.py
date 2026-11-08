@@ -31,6 +31,8 @@ Routes:
 
 from __future__ import annotations
 
+from contextlib import ExitStack
+
 import json
 import logging
 import os
@@ -59,7 +61,8 @@ from .dat import DatIndex, parse_dat
 from .decompress import run_batch as run_decompress_batch, scan_compressed
 from .titled import TitleDBIndex, build_index as build_titled_index, validate_switch_rom
 from .downloaders import (
-    CLIENT_TYPES, NZBGet, NzbgetConfig, SABnzbd, SabConfig, build_client,
+    AmbiguousQueueMatch, CLIENT_TYPES, NZBGet, NzbgetConfig, SABnzbd, SabConfig,
+    Transmission, HubDownloader, build_client,
     hand_off_with_id, match_queue_item, merge_secrets, pick_client, redact,
 )
 from .indexers import INDEXER_TYPES, build_indexer, merge_indexer_secrets, redact_indexer
@@ -751,6 +754,11 @@ class ROMarr:
             def read() -> float:
                 return float(self.store.settings.get(key) or 0) * 3600
             return read
+
+        if str(e.get("ROMARR_STANDALONE_EXPORT", "")).lower() in ("1", "true", "yes"):
+            from .standalone import configure_export
+            configure_export(self.store, self.library)
+            self.reload_libraries()
 
         self.scheduler = Scheduler()
         self.scheduler.add(
@@ -1875,7 +1883,8 @@ class ROMarr:
                 return None
             if any(q.game.strip().casefold() == key[0]
                    and q.platform.strip().casefold() == key[1]
-                   and q.state in ("queued", "grabbed", "import-review")
+                   and (q.state in ("queued", "grabbed", "import-review")
+                        or (q.state == "failed" and self._is_hub_row(q)))
                    for q in self.queue):
                 return None
             self._automatic_grab_reservations.add(key)
@@ -1983,6 +1992,7 @@ class ROMarr:
             return {"ok": False, "error": "the request was cancelled"}
         failure_detail = f"{client.name} rejected the release"
         release_fault = True
+        hub_acceptance = "rejected"
         required_file = bool(getattr(pick, "file_selection_required", False))
         selected_file = str(getattr(pick, "torrent_file_path", "") or "")
         local_fetch = getattr(self.prowlarr, "is_prowlarr_download_url", None)
@@ -2003,11 +2013,8 @@ class ROMarr:
             if not ok:
                 failure_detail = (client.last_error or
                                   "qBittorrent could not select the exact file")
-        elif (isinstance(client, QBittorrent) and callable(local_fetch)
+        elif ((isinstance(client, QBittorrent) or type(client) is Transmission) and callable(local_fetch)
                 and local_fetch(pick.download_url)):
-            # Prowlarr's authenticated URL is LAN-only and contains its API
-            # key. Fetch it here, then upload only the .torrent bytes to the
-            # download client; never give qBittorrent that URL.
             try:
                 torrent = self.prowlarr.fetch_torrent(pick.download_url)
             except ProwlarrDownloadError as err:
@@ -2015,9 +2022,6 @@ class ROMarr:
                 release_fault = False
                 failure_detail = str(err)
             else:
-                # Prowlarr may answer a .torrent request with a terminal magnet
-                # redirect. Keep the safe local fetch path, then pass that URI
-                # to qBittorrent instead of treating it as torrent bytes.
                 if isinstance(torrent, str):
                     ok = client.add(torrent)
                 else:
@@ -2026,7 +2030,18 @@ class ROMarr:
                 release_fault = False
                 if not ok:
                     failure_detail = (
-                        "qBittorrent did not confirm the uploaded torrent")
+                        f"{client.name} did not confirm the uploaded torrent")
+        elif isinstance(client, HubDownloader):
+            release_fault = False
+            try:
+                ok, download_id = hand_off_with_id(client, pick.download_url,
+                                                   name=pick.title)
+                hub_acceptance = "accepted" if ok else "rejected"
+            except (OSError, ValueError) as err:
+                ok, download_id = False, ""
+                hub_acceptance = "uncertain"
+                failure_detail = (f"Cannot persist Hub handoff: {err}. "
+                                  "Repair job identity before Search again or removal.")
         else:
             ok, download_id = hand_off_with_id(client, pick.download_url,
                                                name=pick.title)
@@ -2045,7 +2060,11 @@ class ROMarr:
                          selected_file=(getattr(client, "last_selected_file", {})
                                         if required_file and ok else {}),
                          retained_torrent_hash=(getattr(client, "last_retained_hash", "")
-                                                if required_file else ""))
+                                                if required_file else ""),
+                         download_protocol=getattr(client, "protocol", ""),
+                         hub_acceptance=(hub_acceptance if isinstance(client, HubDownloader)
+                                         and not required_file else ""),
+                         hub_failure_recorded=isinstance(client, HubDownloader) and not ok)
         self.store.enqueue(item)
         if ok and required_file:
             self._remember_collection_owners()
@@ -2241,15 +2260,35 @@ class ROMarr:
         except (OSError, ValueError, RuntimeError, TypeError, MissingArchiveTool, RequestException, zipfile.BadZipFile, subprocess.SubprocessError) as exc:
             return {"error": str(exc)}
 
-    def queue_action(self, index: int, action: str) -> dict:
-        """Act on one queue row: retry it, or forget it.
+    def _is_hub_row(self, item) -> bool:
+        if item.download_protocol:
+            return item.download_protocol == "hub"
+        if (item.file_selection_required or item.selected_file
+                or item.download_id.startswith("qbit-tag:")
+                or "minerva" in item.indexer.lower()):
+            return False
+        return (item.indexer.startswith("hub:") or any(
+            isinstance(c, HubDownloader) and getattr(c, "romarr_id", "")
+            and c.romarr_id == item.download_client for c in self.clients))
 
-        The queue was a read-only list -- a download could sit "failed" with
-        its reason shown and no way to do anything about it but edit the
-        state file. Retry re-runs the request through the normal path;
-        remove forgets a row that is done with (imported, or a failure you
-        have read).
-        """
+    def _hub_client_for(self, item):
+        matches = [c for c in self.clients if isinstance(c, HubDownloader)
+                   and getattr(c, "romarr_id", "") == item.download_client
+                   and item.download_client]
+        if len(matches) != 1:
+            raise ValueError("Hub client identity is missing or ambiguous; repair download_client")
+        return matches[0]
+
+    def _dismiss_hub(self, item):
+        if item.hub_acceptance == "rejected":
+            return
+        if item.hub_acceptance == "uncertain" and not item.download_id:
+            raise ValueError("Hub acceptance is uncertain; repair download_id before continuing")
+        self._hub_client_for(item).dismiss(item)
+
+    def queue_action(self, index: int, action: str, identity: dict | None = None) -> dict:
+        if action not in ("remove", "retry", "resume-retained"):
+            return {"ok": False, "error": f"unknown action {action!r}"}
         with self._lock:
             if not 0 <= index < len(self.queue):
                 return {"ok": False, "error": "no such queue item"}
@@ -2266,39 +2305,45 @@ class ROMarr:
                 except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
                     return {"ok": False, "error": str(exc)}
                 return {"ok": bool(ok), "message": "Retained torrent resumed. Retry the pending grab." if ok else "Downloader refused to resume"}
-        if action == "remove":
-            with self._lock:
-                self.queue = [q for n, q in enumerate(self.queue)
-                              if n != index]
-            return {"ok": True, "removed": True}
-        if action == "retry" and (item.import_intent or item.state in ("import-failed", "import-review")):
+        if action == "retry" and not self._is_hub_row(item) and (item.import_intent or item.state in ("import-failed", "import-review")):
             item.state = "grabbed"
             self.store.save()
             return {"ok": True, "import_retry": True}
+        with self._lock:
+            if self._is_hub_row(item):
+                expected = {k: getattr(item, k) for k in
+                            ("at", "download_id", "download_client", "release")}
+                if identity != expected:
+                    return {"ok": False, "error": "Queue changed; refresh before acting on this Hub job"}
+                try:
+                    self._dismiss_hub(item)
+                except (OSError, ValueError) as err:
+                    return {"ok": False, "error": str(err)}
+            self.queue = [q for q in self.queue if q is not item]
         if action == "retry":
-            # Drop the stale row first so the retry's outcome is the only
-            # one for this game, then run the same request a person would.
-            with self._lock:
-                self.queue = [q for n, q in enumerate(self.queue)
-                              if n != index]
+            if self._is_hub_row(item) and item.external_request_id:
+                return self.request(item.game, item.platform,
+                                    external_request_id=item.external_request_id)
             return self.request(item.game, item.platform)
-        return {"ok": False, "error": f"unknown action {action!r}"}
+        return {"ok": True, "removed": True}
 
     def clear_queue(self, state: str = "") -> dict:
-        """Empty the queue, or just the rows in one state.
-
-        `clear_queue("failed")` is the common one: a sweep left twenty
-        failures whose reason you have read, and removing them one by one is
-        busywork.
-        """
+        removed = 0
+        errors = []
         with self._lock:
-            before = len(self.queue)
-            if state:
-                self.queue = [q for q in self.queue if q.state != state]
-            else:
-                self.queue = []
-            removed = before - len(self.queue)
-        return {"ok": True, "removed": removed}
+            for item in list(self.queue):
+                if state and item.state != state:
+                    continue
+                if self._is_hub_row(item):
+                    try:
+                        self._dismiss_hub(item)
+                    except (OSError, ValueError) as err:
+                        errors.append({"game": item.game, "download_id": item.download_id,
+                                       "download_client": item.download_client, "error": str(err)})
+                        continue
+                self.queue = [q for q in self.queue if q is not item]
+                removed += 1
+        return {"ok": not errors, "removed": removed, "errors": errors}
 
     def grab_candidate(self, release_id: str, platform_name: str = "") -> dict:
         """Grab one release the user picked out of a search."""
@@ -2678,7 +2723,7 @@ class ROMarr:
         dead: list[QueueItem] = []
         with self._lock:
             for row in self.queue:
-                if row.blocklisted or not row.release_id:
+                if self._is_hub_row(row) or row.blocklisted or not row.release_id:
                     continue
                 failure = (failures.get((row.download_client, row.download_id))
                            if row.download_client and row.download_id else None)
@@ -3012,7 +3057,8 @@ class ROMarr:
                 prefer_hardlinks=bool(self.store.settings.get("prefer_hardlinks", False)),
                               layout=self.library_layout(target_cfg),
                               translation=is_translation(source.name),
-                              platform_folders=self.platform_folders(target_cfg))
+                              platform_folders=self.platform_folders(target_cfg),
+                              export_only=self.store.settings.get("standalone_export", False))
 
         imported, refused = [], []
         for outcome in outcomes:
@@ -3063,7 +3109,8 @@ class ROMarr:
                 "fallback_reason": outcome.fallback_reason,
             })
 
-        if imported and self.store.settings.get("rescan_after_import", True):
+        if (imported and not self.store.settings.get("acquisition_only", False)
+                and self.store.settings.get("rescan_after_import", True)):
             target_lib.rescan(platform.slug)
         self.store.save()
 
@@ -3166,6 +3213,10 @@ class ROMarr:
         each import (scoped to the importing platform) and via
         ``POST /api/v1/collection/reconcile``.
         """
+        if self.store.settings.get("acquisition_only", False):
+            return {"ok": True, "platform": platform_slug, "dropped": 0,
+                    "skipped": "acquisition-only mode does not reconcile the outgoing folder"}
+
         from .library import _source_for
         from .dat import VERIFIED as _VERIFIED, hash_bytes as _hash_bytes
 
@@ -6290,8 +6341,48 @@ class ROMarr:
             queue_item.detail = detail
         return {"name": name, "ok": False, "reason": detail}
 
+    def _reconcile_hub(self, client):
+        with self._lock:
+            failures = {j["id"]: j for j in client.failed_jobs()}
+            for item in self.queue:
+                if (item.download_client != getattr(client, "romarr_id", "")
+                        or not item.download_client
+                        or item.state not in ("grabbed", "failed")):
+                    continue
+                item.download_protocol = "hub"
+                if item.hub_acceptance in ("uncertain", "rejected") and not item.download_id:
+                    continue
+                try:
+                    job = client.job_for(item)
+                except (OSError, ValueError) as err:
+                    item.state, item.detail, item.release_fault = "failed", str(err), False
+                    continue
+                item.download_id = job["id"]
+                failure = failures.get(job["id"])
+                if failure is None:
+                    if job.get("state") == "done" and item.state == "failed":
+                        item.state, item.detail = "grabbed", ""
+                        if item.external_request_id:
+                            self.store.update_seerr_request(item.external_request_id,
+                                                            status="downloading")
+                    continue
+                item.state, item.detail, item.release_fault = "failed", failure["detail"], False
+                if not item.hub_failure_recorded:
+                    self.store.record(Event(kind="failed", game=item.game,
+                                            platform=item.platform, release=item.release,
+                                            detail=item.detail))
+                    item.hub_failure_recorded = True
+                self.store.note_failure(item.game, item.platform, item.detail)
+                if item.external_request_id:
+                    self.store.update_seerr_request(item.external_request_id,
+                                                    status="failed", error=item.detail)
+            self.store.save()
+
     def import_finished(self, *, retry_failed: bool = True) -> list[dict]:
-        with self._collection_lock:
+        with self._collection_lock, ExitStack() as sessions:
+            for client in self.clients:
+                if isinstance(client, HubDownloader):
+                    sessions.enter_context(client.import_session())
             return self._import_finished(retry_failed=retry_failed)
 
     def _import_finished(self, *, retry_failed: bool = True) -> list[dict]:
@@ -6311,27 +6402,58 @@ class ROMarr:
                 for item in self.queue:
                     if item.state == "import-failed":
                         item.state = "grabbed"
+                        item.detail = ""
             self.store.save()
         results = []
         finished = []
+        with self._lock:
+            for item in self.queue:
+                if self._is_hub_row(item) and item.state in ("grabbed", "failed"):
+                    try:
+                        self._hub_client_for(item)
+                    except ValueError as err:
+                        item.state, item.detail, item.release_fault = "failed", str(err), False
         for client in self.clients:
             if not getattr(client, "configured", True):
                 continue
+            is_hub = isinstance(client, HubDownloader)
             try:
+                if is_hub:
+                    self._reconcile_hub(client)
                 if isinstance(client, QBittorrent):
-                    finished.extend(dict(row, _romarr_client=client)
+                    finished.extend(dict(row, _romarr_client=client, **({"hub_client": client} if is_hub else {}))
                                     for row in client.selective_completed(list(self.queue), ownership=self._retained_owners()))
-                finished.extend(dict(row, _romarr_client=client)
+                finished.extend(dict(row, _romarr_client=client, **({"hub_client": client} if is_hub else {}))
                                 for row in client.completed())
             except Exception as err:
-                # One unreachable client must not stop the others importing.
                 log.warning("%s completed() failed: %s", getattr(client, "name", client), err)
+            finally:
+                if is_hub:
+                    try:
+                        self._reconcile_hub(client)
+                    except (OSError, ValueError) as err:
+                        log.warning("Hub reconciliation failed: %s", err)
         for torrent in finished:
             name = torrent.get("name", "")
             platform = None
             queue_item = None
             with self._lock:
-                match = match_queue_item(self.queue, torrent)
+                try:
+                    candidates = self.queue
+                    if torrent.get("hub_client") is not None:
+                        candidates = [q for q in self.queue
+                                      if q.download_client == getattr(torrent["hub_client"], "romarr_id", "")
+                                      and q.download_id == torrent.get("id")
+                                      and q.state == "grabbed"]
+                    match = match_queue_item(candidates, torrent)
+                except AmbiguousQueueMatch as err:
+                    # A shared torrent cannot be assigned safely to one pending request.
+                    for item in err.items:
+                        item.state = "import-failed"
+                        item.detail = str(err)
+                    self.store.record(Event(kind="failed", game=name, platform="", detail=str(err)))
+                    results.append({"name": name, "ok": False, "reason": str(err)})
+                    continue
                 if match is not None:
                     queue_item = match
                     if match.state not in ("imported", "import-failed"):
@@ -6351,6 +6473,8 @@ class ROMarr:
                             if inferred is not None:
                                 platform = inferred
                                 match.platform = inferred.slug
+            if torrent.get("hub_client") is not None and queue_item is None:
+                continue
             if queue_item is not None and queue_item.state in ("imported", "import-failed"):
                 continue
             if platform is None:
@@ -6430,6 +6554,7 @@ class ROMarr:
                 results.append({"name": name, "ok": False, "reason": detail})
                 if queue_item is not None:
                     queue_item.state = "import-failed"
+                    queue_item.detail = detail
                 continue
             target_cfg, target_lib = target
             label = target_cfg.get("name") or getattr(target_lib, "name", "library")
@@ -6455,7 +6580,7 @@ class ROMarr:
                     # A bad archive belongs to this row, not to every completed
                     # job behind it. Preserve sources and make the failure visible.
                     queue_item.state = "import-failed"
-                    queue_item.detail = f"could not preview import: {exc}"
+                    queue_item.detail = f"could not preview import: {getattr(exc, 'stderr', None) or exc}"
                     self.store.record(Event(kind="failed", game=queue_item.game,
                                             platform=platform.slug, detail=queue_item.detail))
                     results.append({"name": name, "ok": False, "reason": queue_item.detail})
@@ -6488,6 +6613,7 @@ class ROMarr:
                 layout=self.library_layout(target_cfg),
                 translation=is_translation(name),
                 platform_folders=self.platform_folders(target_cfg),
+                export_only=self.store.settings.get("standalone_export", False),
                 **({"selected_primaries": selected_primaries} if selected_primaries is not None else {}),
                 **({"bundle_routes": bundle_routes} if bundle_routes is not None else {}))
             game_title = (queue_item.game if queue_item and getattr(queue_item, "game", "") else name)
@@ -6526,6 +6652,7 @@ class ROMarr:
                 # Marked so the scheduled sweep never re-attempts it; the
                 # Tasks page button clears failure marks to retry.
                 queue_item.state = "imported" if all_ok else "import-failed"
+                queue_item.detail = "" if all_ok else next((str(o.reason) for o in outcomes if not o.ok), "")
             if all_ok and queue_item is not None:
                 # If this was a partial collection grab (e.g. MiNERVA selective grab with qbit-tag:),
                 # clean up the partial collection torrent and its files from the client so it does not
@@ -6546,7 +6673,8 @@ class ROMarr:
                                 log.warning("could not clean up collection torrent %r: %s",
                                             queue_item.download_id, err)
             if all_ok:
-                if self.store.settings.get("rescan_after_import", True):
+                if (not self.store.settings.get("acquisition_only", False)
+                        and self.store.settings.get("rescan_after_import", True)):
                     target_lib.rescan(platform.slug)
                 # The absolute destinations this release was imported to.
                 # Cartridge streams them back to the player; external
@@ -6579,7 +6707,8 @@ class ROMarr:
                 # that are already present and verified in the library but were
                 # never fulfilled (word-order/alias titles, pre-existing stale
                 # entries). Gated by setting so the hash walk can be disabled.
-                if fulfils_base and self.store.settings.get("reconcile_after_import", True):
+                if (fulfils_base and not self.store.settings.get("acquisition_only", False)
+                        and self.store.settings.get("reconcile_after_import", True)):
                     try:
                         self.reconcile_platform(platform.slug)
                     except Exception:  # noqa: BLE001
@@ -7026,7 +7155,7 @@ def make_handler(service: ROMarr):
             if route.path == "/api/v1/queue/import-plan":
                 return self._json(200, service.queue_import_plan(int((query.get("index") or ["-1"])[0]), {}))
             if route.path == "/api/v1/queue":
-                return self._json(200, {"items": [asdict(i) for i in service.queue]})
+                return self._json(200, {"items": [{**asdict(i), "hub": service._is_hub_row(i)} for i in service.queue]})
             if route.path == "/api/v1/history":
                 limit = int((query.get("limit") or ["100"])[0])
                 return self._json(200, {"items": service.store.history(limit)})
@@ -7553,6 +7682,7 @@ def make_handler(service: ROMarr):
                 return self._json(200, {"available": hub.available(),
                                         "sandboxed": confined,
                                         "sandbox_detail": why,
+                                        "archive_org_auth": hub.archive_org_auth_status(),
                                         "searchable_plugins": searchable,
                                         # The Plugins page says out loud what
                                         # enabling a plugin now does: its
@@ -8016,7 +8146,8 @@ def make_handler(service: ROMarr):
                 return self._json(200, service.queue_import_plan(int(body.get("index", -1)), body))
             if route.path == "/api/v1/queue/action":
                 return self._json(200, service.queue_action(
-                    int(body.get("index", -1)), str(body.get("action") or "")))
+                    int(body.get("index", -1)), str(body.get("action") or ""),
+                    body.get("identity")))
             if route.path == "/api/v1/queue/clear":
                 return self._json(200, service.clear_queue(
                     str(body.get("state") or "")))
@@ -8221,6 +8352,11 @@ def make_handler(service: ROMarr):
                     "ok": got.ok, "url": got.url, "host": got.host,
                     "reason": got.reason,
                 })
+            if route.path == "/api/v1/hub/archive-org/auth":
+                result = hub.archive_org_auth_configure(
+                    email=body.get("email", ""), password=body.get("password", ""),
+                    clear=body.get("clear", False))
+                return self._json(200 if result.get("ok") else 400, result)
             if route.path == "/api/v1/hub/plugin":
                 slug = (body.get("slug") or "").strip()
                 action = (body.get("action") or "").strip()

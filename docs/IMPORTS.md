@@ -8,7 +8,7 @@ ROMarr never changes download file permissions to make a link work. Files with p
 
 **Keep completed downloads for seeding after import** is enabled by default. This is independent of the linking option. Disabling it permits cleanup only after a fully successful import when the torrent is not shared by other retained requests. Shared collection torrents are protected even with retention disabled; remove them deliberately in the downloader when all seeding and requests are finished. Failed or partially successful imports always retain the source.
 
-Files are staged on the library filesystem, checked, then published without overwriting a racing destination. Existing zero-byte destinations require inspection. If a set partially publishes before an error, reconcile the completed members before retrying; existing files are never blindly accepted as successful imports.
+Files are staged on the library filesystem, checked, then published without overwriting a racing destination. Existing zero-byte destinations require inspection. Multi-file sets publish together by directory rename; nonempty destination directories are preserved even when overwrite is requested. Publication is per game, so a multi-game import can still have mixed outcomes; existing files are never blindly accepted as successful imports.
 
 ## Request another game from a retained MiNERVA collection
 

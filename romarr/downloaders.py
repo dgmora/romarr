@@ -35,6 +35,8 @@ import re
 import secrets
 import threading
 import time
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -494,6 +496,7 @@ class TransmissionConfig:
     password: str = ""
     category: str = "romarr"
     timeout: int = 30
+    save_path: str = ""
 
 
 class Transmission:
@@ -518,6 +521,7 @@ class Transmission:
         self._config = config
         self._session = session or requests.Session()
         self._session_id = ""
+        self.last_job_id = ""
 
     @property
     def configured(self) -> bool:
@@ -552,9 +556,17 @@ class Transmission:
             return False
 
     def add(self, magnet_or_url: str, *, save_path: str | None = None) -> bool:
-        arguments = {"filename": magnet_or_url}
-        if save_path:
-            arguments["download-dir"] = save_path
+        return self._add({"filename": magnet_or_url}, save_path=save_path)
+
+    def add_torrent_file(self, torrent: bytes, *, save_path: str | None = None) -> bool:
+        return self._add({"metainfo": base64.b64encode(torrent).decode("ascii")},
+                         save_path=save_path)
+
+    def _add(self, arguments: dict, *, save_path: str | None = None) -> bool:
+        self.last_job_id = ""
+        destination = save_path or self._config.save_path
+        if destination:
+            arguments["download-dir"] = destination
         if self._config.category:
             arguments["labels"] = [self._config.category]
         try:
@@ -569,7 +581,60 @@ class Transmission:
         if body.get("result") != "success":
             log.warning("Transmission refused the torrent: %s", body.get("result"))
             return False
+        added = body.get("arguments", {})
+        job = added.get("torrent-added") or added.get("torrent-duplicate") or {}
+        identity = str(job.get("hashString") or "").lower()
+        if not identity:
+            log.warning("Transmission did not return a torrent identity")
+            return False
+        if added.get("torrent-duplicate"):
+            # torrent-add does not apply labels or move an existing torrent.
+            # Never adopt another application's data or change its ownership.
+            try:
+                existing = self._call("torrent-get", {"ids": [identity],
+                    "fields": ["hashString", "labels", "downloadDir"]})
+            except Exception as exc:
+                log.warning("Could not inspect duplicate torrent: %s", exc)
+                return False
+            rows = existing.get("arguments", {}).get("torrents", [])
+            owned = (existing.get("result") == "success" and len(rows) == 1
+                     and str(rows[0].get("hashString") or "").lower() == identity
+                     and bool(self._config.category) and bool(destination)
+                     and self._config.category in rows[0].get("labels", [])
+                     and str(rows[0].get("downloadDir") or "").rstrip("/")
+                         == str(destination).rstrip("/"))
+            if not owned:
+                log.warning("Duplicate torrent is outside ROMarr's label or download directory; refusing adoption")
+                return False
+        self.last_job_id = identity
         return True
+
+
+    def completed(self) -> list[dict]:
+        body = self._call("torrent-get", {"fields": [
+            "name", "hashString", "downloadDir", "labels",
+            "leftUntilDone", "percentDone", "totalSize",
+        ]})
+        if body.get("result") != "success":
+            raise RuntimeError("Transmission could not list completed downloads")
+        out = []
+        for torrent in body.get("arguments", {}).get("torrents", []):
+            if self._config.category and self._config.category not in torrent.get("labels", []):
+                continue
+            if (torrent.get("leftUntilDone", 1) != 0
+                    or torrent.get("percentDone", 0) < 1
+                    or torrent.get("totalSize", 0) <= 0):
+                continue
+            directory = str(torrent.get("downloadDir") or "").rstrip("/")
+            if self._config.save_path and directory != self._config.save_path.rstrip("/"):
+                continue
+            name = str(torrent.get("name") or "")
+            if directory and name:
+                out.append({"name": name, "hash": torrent.get("hashString", ""),
+                            "id": str(torrent.get("hashString") or "").lower(),
+                            "content_path": directory + "/" + name,
+                            "save_path": directory, "category": self._config.category})
+        return out
 
 
 class Vuze(Transmission):
@@ -3124,6 +3189,8 @@ class HubDownloader:
     TAKES_NAME = True
 
     LEDGER = ".romarr-hub.json"
+    _ledgers_lock = threading.Lock()
+    _ledgers = {}
 
     protocol = "hub"
 
@@ -3132,6 +3199,13 @@ class HubDownloader:
         #: Injectable for tests; live use goes through hub.fetch, which owns
         #: the PluginProcess lifecycle and the sandbox policy.
         self._fetch = fetch
+        self._added = threading.local()
+        self._session = threading.local()
+        key = str(self._ledger_path().resolve())
+        with self._ledgers_lock:
+            self._coord = self._ledgers.setdefault(
+                key, (threading.RLock(), set(), {}))
+        self._lock, self._active, self._unsaved = self._coord
         self.detail = ""
         self.path_mappings: list | tuple = ()
 
@@ -3165,7 +3239,9 @@ class HubDownloader:
                       + ", ".join(plugins)
         return True
 
-    # -- the ledger (same shape as the site lane's) --------------------------
+    @property
+    def last_job_id(self) -> str:
+        return getattr(self._added, "job_id", "")
 
     def _ledger_path(self) -> Path:
         return Path(self._config.save_path) / self.LEDGER
@@ -3173,77 +3249,170 @@ class HubDownloader:
     def _read(self) -> list[dict]:
         try:
             rows = json.loads(self._ledger_path().read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except FileNotFoundError:
             return []
-        return [r for r in rows if isinstance(r, dict)]
+        if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
+            raise ValueError("invalid Hub ledger; repair it before continuing")
+        for row in rows:
+            if not row.get("id"):
+                row["id"] = "legacy-" + hashlib.sha256(
+                    json.dumps(row, sort_keys=True).encode()).hexdigest()
+        return rows
 
     def _write(self, rows: list[dict]) -> None:
+        path = self._ledger_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
         try:
-            path = self._ledger_path()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(rows, indent=1), encoding="utf-8")
-        except OSError as err:
-            log.warning("could not record the hub download queue: %s", err)
+            with tempfile.NamedTemporaryFile(mode="w", dir=path.parent,
+                                             delete=False, encoding="utf-8") as f:
+                temporary = f.name
+                json.dump(rows, f, indent=1)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
 
     def add(self, url: str, *, save_path: str | None = None,
             name: str = "") -> bool:
-        """Record a hub job. The plugin fetch happens in the next sweep."""
-        if not self.configured:
-            return False
-        if not str(url or "").startswith("hub://"):
-            log.warning("hub downloader was handed a %s link, not a hub:// one",
-                        str(url).split(":", 1)[0] or "blank")
+        self._added.job_id = ""
+        if not self.configured or not str(url or "").startswith("hub://"):
             return False
         from . import hub
         try:
             hub.decode_result(url)
-        except ValueError as err:
-            log.warning("refusing an undecodable hub release: %s", err)
+        except ValueError:
             return False
-        rows = self._read()
-        if any(r.get("url") == url and r.get("state") in ("pending", "done")
-               for r in rows):
-            return True
-        rows.append({
-            "url": url,
-            "name": name,
-            "save_path": save_path or self._config.save_path,
-            "state": "pending",
-            "detail": "",
-            "file": "",
-            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        })
-        self._write(rows)
+        with self._lock:
+            rows = self._read()
+            existing = next((r for r in rows if r.get("url") == url
+                             and r.get("state") in ("pending", "done")), None)
+            if existing is None:
+                existing = {"id": secrets.token_hex(16), "url": url, "name": name,
+                            "save_path": save_path or self._config.save_path,
+                            "state": "pending", "detail": "", "file": "",
+                            "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+                rows.append(existing)
+            self._write(rows)
+            self._added.job_id = existing["id"]
         return True
 
+    def job_for(self, item) -> dict:
+        with self._lock:
+            rows = self._read()
+            if item.download_id:
+                matches = [r for r in rows if r["id"] == item.download_id]
+            else:
+                from . import hub
+                matches = []
+                for row in rows:
+                    if row.get("name") != item.release:
+                        continue
+                    result = hub.decode_result(row.get("url", ""))
+                    identity = (f"hub:{result.get('plugin', '')}|{row.get('name', '')}|"
+                                f"{int(result.get('size_bytes') or 0)}").lower()
+                    if not item.release_id or item.release_id == identity:
+                        matches.append(row)
+            if len(matches) > 1:
+                raise ValueError("More than one Hub download matches this queue item; "
+                                 "ROMarr cannot safely choose one")
+            if (not matches or matches[0].get("state") == "dismissed"
+                    or matches[0].get("name") != item.release):
+                raise ValueError("Could not match this queue item to its Hub download; "
+                                 "the download may be missing or its details may have changed")
+            return dict(matches[0])
+
+    def dismiss(self, item) -> None:
+        with self._lock:
+            job = self.job_for(item)
+            if job["id"] in self._active:
+                raise ValueError("Hub job is owned by an active fetch/import; try again after it finishes")
+            if job["id"] in self._unsaved:
+                raise ValueError("Hub result is not persisted; restore ledger writes and run import first")
+            rows = self._read()
+            for row in rows:
+                if row["id"] == job["id"]:
+                    row["state"] = "dismissed"
+            self._write(rows)
+
+    @contextmanager
+    def import_session(self):
+        owned = set()
+        self._session.owned = owned
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._active.difference_update(owned)
+            del self._session.owned
+
+    def failed_jobs(self) -> list[dict]:
+        with self._lock:
+            rows = {r["id"]: r for r in self._read()}
+            for identity, (result, error) in self._unsaved.items():
+                rows[identity] = {**result, "state": "failed",
+                                  "detail": (result.get("detail") or "fetch completed")
+                                  + "; cannot persist Hub result: " + error}
+            return [{**row, "release_fault": False} for row in rows.values()
+                    if row.get("state") == "failed"]
+
     def completed(self) -> list[dict]:
-        """Fetch what is pending, then report everything already here."""
         if not self.configured:
             return []
-        rows = self._read()
-        fetched = 0
-        for row in rows:
-            if row.get("state") != "pending":
-                continue
-            if fetched >= self._config.max_active:
-                break
-            fetched += 1
-            self._run(row)
-        if fetched:
-            self._write(rows)
+        with self._lock:
+            for identity, (result, _) in list(self._unsaved.items()):
+                rows = self._read()
+                for row in rows:
+                    if row["id"] == identity:
+                        row.update(result)
+                try:
+                    self._write(rows)
+                except OSError as err:
+                    self._unsaved[identity] = (result, str(err))
+                    raise
+                del self._unsaved[identity]
+            pending = [dict(r) for r in self._read()
+                       if r.get("state") == "pending" and r["id"] not in self._active]
+        for result in pending[:self._config.max_active]:
+            identity = result["id"]
+            with self._lock:
+                current = next((r for r in self._read() if r["id"] == identity), {})
+                if current.get("state") != "pending" or identity in self._active:
+                    continue
+                self._active.add(identity)
+            try:
+                self._run(result)
+                with self._lock:
+                    rows = self._read()
+                    for row in rows:
+                        if row["id"] == identity:
+                            row.update(result)
+                    try:
+                        self._write(rows)
+                    except OSError as err:
+                        self._unsaved[identity] = (result, str(err))
+                        raise
+            finally:
+                with self._lock:
+                    self._active.discard(identity)
         out = []
-        for row in rows:
-            if row.get("state") != "done" or not row.get("file"):
-                continue
-            path = Path(row["file"])
-            if not path.exists():
-                continue
-            out.append({
-                "name": row.get("name") or path.name,
-                "content_path": str(path),
-                "save_path": str(path.parent),
-                "state": "done",
-            })
+        with self._lock:
+            for row in self._read():
+                if (row.get("state") != "done" or not row.get("file")
+                        or row["id"] in self._active or row["id"] in self._unsaved):
+                    continue
+                path = Path(row["file"])
+                if not path.exists():
+                    continue
+                owned = getattr(self._session, "owned", None)
+                if owned is not None:
+                    self._active.add(row["id"])
+                    owned.add(row["id"])
+                out.append({"id": row["id"], "name": row.get("name") or path.name,
+                            "content_path": str(path), "save_path": str(path.parent),
+                            "state": "done"})
         return out
 
     def _run(self, row: dict) -> None:
@@ -3300,6 +3469,14 @@ def hand_off_with_id(client, url: str, *, name: str = "") -> tuple[bool, str]:
     return ok, (getattr(client, "last_job_id", "") or "") if ok else ""
 
 
+class AmbiguousQueueMatch(ValueError):
+    def __init__(self, items):
+        self.items = items
+        super().__init__("Multiple pending requests match the same download ("
+                         + ", ".join(item.game for item in items)
+                         + "); resolve duplicate queue entries before retrying import")
+
+
 def match_queue_item(queue, download: dict):
     """The queue row a finished download belongs to, or None.
 
@@ -3318,11 +3495,14 @@ def match_queue_item(queue, download: dict):
     found = str(download.get("hash") or "").strip().lower()
     job = str(download.get("id") or "").strip()
     if found or job:
-        for item in queue:
-            if found and item.release_id == f"btih:{found}":
-                return item
-            if job and item.download_id == job:
-                return item
+        matches = [item for item in queue
+                   if (found and item.release_id == f"btih:{found}")
+                   or (job and item.download_id == job)]
+        pending = [item for item in matches if item.state == "grabbed"]
+        if len(pending) > 1:
+            raise AmbiguousQueueMatch(pending)
+        if matches:
+            return pending[0] if pending else matches[0]
 
     def identity_conflicts(item):
         release_id = str(getattr(item, "release_id", "") or "")
@@ -3418,6 +3598,7 @@ CLIENT_TYPES = {
             FIELD("username", "Username"),
             FIELD("password", "Password", "secret"),
             FIELD("category", "Label", default="romarr"),
+            FIELD("save_path", "Download directory"),
         ],
     },
     "deluge": {
@@ -3823,7 +4004,8 @@ def build_client(cfg: dict):
     elif kind == "transmission":
         client = Transmission(TransmissionConfig(
             base_url=url, username=cfg.get("username", ""),
-            password=cfg.get("password", ""), category=category))
+            password=cfg.get("password", ""), category=category,
+            save_path=cfg.get("save_path", "")))
     elif kind == "deluge":
         client = Deluge(DelugeConfig(
             base_url=url, password=cfg.get("password", ""), category=category))

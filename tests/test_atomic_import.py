@@ -89,7 +89,8 @@ def test_failed_set_member_never_publishes_incomplete_set(tmp_path, monkeypatch)
     assert (source / "game.bin").read_bytes() == b"payload"
 
 
-def test_partial_import_never_cleans_source_or_fulfils_request(tmp_path, monkeypatch):
+@pytest.mark.parametrize("acquisition_only", [False, True])
+def test_partial_import_never_cleans_source_or_fulfils_request(tmp_path, monkeypatch, acquisition_only):
     import romarr.app as app
     from romarr.app import ROMarr, QueueItem
 
@@ -105,6 +106,7 @@ def test_partial_import_never_cleans_source_or_fulfils_request(tmp_path, monkeyp
     item = QueueItem("Game", "gb", "bundle", 1, "grabbed", download_id="qbit-tag:job",
                      external_request_id="external-124")
     service.queue.append(item)
+    service.store.settings["acquisition_only"] = acquisition_only
     removed, updated, rescanned, reconciled = [], [], [], []
 
     class Client:

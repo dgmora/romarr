@@ -86,7 +86,7 @@ def test_the_sweep_fetches_through_the_plugin_and_reports_the_file(tmp_path):
     client.add(hub.encode_result(ROW), name="Super Metroid (USA)")
     done = client.completed()
     assert fetched and fetched[0][0] == ROW
-    assert done == [{"name": "Super Metroid (USA)",
+    assert done == [{"id": client.last_job_id, "name": "Super Metroid (USA)",
                      "content_path": str(tmp_path / "Super Metroid (USA).sfc"),
                      "save_path": str(tmp_path),
                      "state": "done"}]
@@ -222,3 +222,12 @@ def test_a_failing_hub_does_not_sink_the_search(tmp_path, monkeypatch):
 
     monkeypatch.setattr(hub, "search", explode)
     assert svc._hub_releases("Super Metroid", _FakePlatform()) == []
+
+
+def test_authentication_status_without_shared_rom_hub(monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "romarr.ia_auth", None)
+    assert hub.archive_org_auth_status() == {
+        "configured": False, "external": False,
+        "error": "Install the pinned ROM Hub version for Archive.org authentication",
+    }

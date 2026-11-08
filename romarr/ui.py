@@ -1254,6 +1254,26 @@ RENDER.hub=async()=>{
         +'data-slug="'+esc(pl.slug)+'">'+(pl.enabled?'Disable':'Enable')+'</button>'
       : '<button class="mini accent" data-act="install" data-slug="'+esc(pl.slug)+'">Install'
         +(pl.key_required?' · key needed':'')+'</button>';
+    // Archive.org credentials are held by ROMarr's host, not passed to the
+    // plugin subprocess. This UI never reads a saved email or password.
+    const ia=hs.archive_org_auth||{};
+    const authForm=(pl.slug==='archive-org'&&pl.installed)
+      ?'<div style="margin-top:12px"><b>Archive.org login</b>'
+        +'<p class="help">'+(ia.external
+          ?'Managed by external credentials (read-only here).'
+          :ia.configured?'Account credentials saved. Enter both fields to replace them.'
+          :'Optional account for restricted ZIP listings and downloads.')
+        +'</p>'
+        +(ia.error?'<p class="help">'+esc(ia.error)+'</p>':'')
+        +(ia.external?'':'<form id="ia-auth-form" autocomplete="off">'
+          +'<div class="row"><input id="ia-email" type="email" placeholder="Archive.org email" '
+          +'autocomplete="off" required maxlength="320">'
+          +'<input id="ia-password" type="password" placeholder="Password" '
+          +'autocomplete="new-password" required maxlength="4096"></div>'
+          +'<div class="row"><button class="mini accent" type="submit">Save login</button>'
+          +(ia.configured?'<button class="mini" id="ia-auth-clear" type="button">Clear login</button>':'')
+          +'</div></form>')
+        +'</div>' : '';
     return '<div class="pcard'+(pl.installed?' installed':'')+'">'
       +'<h4>'+esc(pl.name)+(pl.author?'<span class="by">by '+esc(pl.author)+'</span>':'')+'</h4>'
       +'<div class="desc">'+esc(pl.description||'No description supplied.')+'</div>'
@@ -1262,7 +1282,8 @@ RENDER.hub=async()=>{
         ?'<a href="'+esc(pl.repository)+'" target="_blank" rel="noopener">Instructions and source</a>':'')
       +(pl.key_required?'<div class="help">Requires an account or key. Check the instructions before installing.</div>':'')
       +'<div class="foot">'+action
-      +(net?'<span class="net">reaches '+esc(net)+'</span>':'')+'</div></div>';
+      +(net?'<span class="net">reaches '+esc(net)+'</span>':'')+'</div>'
+      +authForm+'</div>';
   };
 
   const render=d=>{
@@ -1401,6 +1422,39 @@ RENDER.hub=async()=>{
       cap = cap===c.dataset.cap ? '' : c.dataset.cap; render(await load());});
     p.querySelectorAll('.chip[data-inst]').forEach(c=>c.onclick=async()=>{
       inst = inst===c.dataset.inst ? '' : c.dataset.inst; render(await load());});
+
+    const iaForm=$('#ia-auth-form');
+    if(iaForm) iaForm.onsubmit=async e=>{
+      e.preventDefault();
+      const email=$('#ia-email').value.trim(), password=$('#ia-password').value;
+      if(!email||!password)return;
+      const btn=iaForm.querySelector('button[type="submit"]');
+      btn.disabled=true;
+      try{
+        const response=await fetch('/api/v1/hub/archive-org/auth',{
+          method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({email,password})});
+        const result=await response.json();
+        actionError=result.ok?'':(result.error||'Could not save Archive.org login');
+        if(result.ok)toast('Archive.org credentials saved');
+      }catch(e){actionError='Could not save Archive.org login';}
+      hs=await j('/api/v1/hub/status').catch(()=>hs);
+      render(await load());
+    };
+    const iaClear=$('#ia-auth-clear');
+    if(iaClear) iaClear.onclick=async()=>{
+      iaClear.disabled=true;
+      try{
+        const response=await fetch('/api/v1/hub/archive-org/auth',{
+          method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({clear:true})});
+        const result=await response.json();
+        actionError=result.ok?'':(result.error||'Could not clear Archive.org login');
+        if(result.ok)toast('Archive.org credentials cleared');
+      }catch(e){actionError='Could not clear Archive.org login';}
+      hs=await j('/api/v1/hub/status').catch(()=>hs);
+      render(await load());
+    };
 
     p.querySelectorAll('button[data-act]').forEach(b=>b.onclick=async()=>{
       const slug=b.dataset.slug, action=b.dataset.act;
@@ -3268,10 +3322,10 @@ RENDER.queue=async()=>{
     <th>Platform</th><th>Release</th><th>Seeders</th><th>State</th><th></th></tr></thead><tbody>
     ${d.items.map((i,n)=>`<tr><td>${esc(i.game)}</td><td>${esc(i.platform)}</td>
       <td>${esc(i.release||'—')}</td><td>${i.seeders||'—'}</td>
-      <td><span class="pill ${esc(i.state)}">${esc(i.state)}</span>
+      <td><span class="pill ${esc(i.state)}">${esc(i.state==='failed'?'Failed':i.state)}</span>
       ${i.detail?`<div style="color:var(--dim);font-size:11.5px">${esc(i.detail)}</div>`:''}
       </td><td style="text-align:right"><div class="rowact">
-        ${['failed','import-failed'].includes(i.state)?`<button data-qretry="${n}">Retry</button>`:''}
+        ${['failed','import-failed'].includes(i.state)?`<button data-qretry="${n}">${i.hub&&i.state==='failed'?'Search again':'Retry'}</button>`:''}
         ${i.state!=='imported'?`<button data-qplan="${n}">Preview import</button>`:''}
         ${i.selected_file?.hash||i.retained_torrent_hash?`<button data-qresume="${n}">Resume retained torrent</button>`:''}
         <button data-qremove="${n}">Remove</button></div></td></tr>`).join('')}
@@ -3287,15 +3341,21 @@ RENDER.queue=async()=>{
   };
   const cf=$('#q-clearfail');
   if(cf) cf.onclick=async()=>{
-    await j('/api/v1/queue/clear',{method:'POST',
+    const r=await j('/api/v1/queue/clear',{method:'POST',
       headers:{'content-type':'application/json'},
       body:JSON.stringify({state:'failed'})});
-    go('queue'); refreshCounts();
+    await RENDER.queue(); refreshCounts();
+    if(r.errors?.length){
+      const errors=document.createElement('div'); errors.className='card'; errors.setAttribute('role','alert');
+      errors.textContent=r.errors.map(e=>`${e.game}: ${e.error}`).join(' · ');
+      $('#page').prepend(errors);
+    }
   };
   const act=async(index,action)=>{
     const r=await j('/api/v1/queue/action',{method:'POST',
       headers:{'content-type':'application/json'},
-      body:JSON.stringify({index:Number(index),action})});
+      body:JSON.stringify({index:Number(index),action,identity:Object.fromEntries(
+        ['at','download_id','download_client','release'].map(k=>[k,d.items[Number(index)][k]]))})});
     toast(r.error||r.message||(action==='retry'?(r.ok?'Grabbed':'Still no luck'):'Removed'));
     go('queue'); refreshCounts();
   };

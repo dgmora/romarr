@@ -355,11 +355,9 @@ def test_issue_107_ui_local_timezone_helpers():
 
 # ------------------------------------------------------------------ #93 ---
 
-def test_issue_93_rom_hub_pin_updated():
-    """#93: Dockerfile, Dockerfile.browser, and docs/PLUGINS.md pin the updated
-    rom-hub commit containing the catalog & Igir v5.8.0 updates."""
+def test_rom_hub_authentication_pin_matches_installation_docs():
     root = pathlib.Path(__file__).resolve().parents[1]
-    expected_sha = "f30123ff9113c2a8067e76e177a2405ca66561ab"
+    expected_sha = "2c66cd22d24a8ec4861a74d7b47f23eab2a8d7ca"
     for rel in ("Dockerfile", "Dockerfile.browser", "docs/PLUGINS.md"):
         content = (root / rel).read_text(encoding="utf-8")
         assert expected_sha in content, f"{rel} does not pin {expected_sha}"

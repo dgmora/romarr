@@ -23,6 +23,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1] / "romarr"
 #: Kept explicit and tiny. A growing exemption list is the same failure
 #: arriving by a slower route.
 STANDALONE = {
+    "delivery",   # separate receiver CLI, run on the library host
     "__init__",
     "__main__",   # the entry point; it imports app, not the other way round
     "app",        # the root of the graph, so it cannot import itself

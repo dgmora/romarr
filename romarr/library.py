@@ -563,12 +563,42 @@ def _existing_destination(destination: Path) -> str:
     return "already in the library; reconcile existing files before retrying"
 
 
+_publish_lock = threading.Lock()
+
+
+def _publish_import(staged: Path, destination: Path, *, overwrite: bool) -> str:
+    with _publish_lock:
+        if destination.is_symlink():
+            return "refusing to replace a symlink destination"
+        if staged.is_dir():
+            if destination.exists():
+                # Sender cleanup can leave an empty disc directory. rmdir is
+                # atomic and refuses files, symlinks and nonempty directories.
+                try:
+                    destination.rmdir()
+                except OSError:
+                    return ("cannot atomically replace an existing disc directory; "
+                            "move it aside before importing" if overwrite
+                            else "already in the library")
+            staged.rename(destination)
+        elif overwrite:
+            if destination.is_dir():
+                return "destination is a directory"
+            os.replace(staged, destination)
+        else:
+            try:
+                _publish_staged(staged, destination, overwrite=False)
+            except FileExistsError:
+                return "already in the library"
+    return ""
+
+
 def import_rom(download: Path, platform: Platform, library_root: Path, *,
                overwrite: bool = False, dats=None,
                require_verified: bool = False,
                layout: str = "flat", translation: bool = False,
                rename: bool = False,
-               platform_folders=None, prefer_hardlinks: bool = False, selected_primaries=None, bundle_routes=None) -> list[ImportResult]:
+               platform_folders=None, prefer_hardlinks: bool = False, selected_primaries=None, bundle_routes=None, export_only: bool = False) -> list[ImportResult]:
     """Place every ROM from a finished download into the library.
 
     A cartridge zip may hold several games (a 3-in-1 collection, a bundle)
@@ -582,6 +612,10 @@ def import_rom(download: Path, platform: Platform, library_root: Path, *,
     The rename option uses verified DAT names for single-file ROMs, retaining
     the physical extension. Multi-file members keep their reference names.
     """
+    if export_only and str(layout).lower() != "flat":
+        return [ImportResult(False, None, "standalone export supports only flat library layout")]
+    if export_only and overwrite:
+        return [ImportResult(False, None, "overwriting published exports is disabled")]
     if not download.exists():
         msg = (
             f"download path does not exist in this container: {download}. "
@@ -596,7 +630,10 @@ def import_rom(download: Path, platform: Platform, library_root: Path, *,
             source.prefer_hardlinks = prefer_hardlinks
         candidates = source.names()
     except (MissingArchiveTool, OSError, ValueError, zipfile.BadZipFile, RuntimeError, subprocess.SubprocessError) as exc:
-        return [ImportResult(False, None, f"source inspection failed: {exc}")]
+        detail = getattr(exc, "stderr", None) or str(exc)
+        if isinstance(detail, bytes):
+            detail = detail.decode(errors="replace")
+        return [ImportResult(False, None, f"source inspection failed: {detail}")]
 
     chosen_sets = pick_all_rom_sets(candidates, platform, read=source.read)
     if selected_primaries is not None:
@@ -606,9 +643,11 @@ def import_rom(download: Path, platform: Platform, library_root: Path, *,
             return [ImportResult(False, None, "selected import members changed; review the bundle again")]
         chosen_sets = [group for group in chosen_sets if group.primary in selected]
     if not chosen_sets:
-        return [ImportResult(
-            False, None,
-            f"no {platform.name} ROM among {len(candidates)} file(s)")]
+        reason = f"no {platform.name} ROM among {len(candidates)} file(s)"
+        nested = [name for name in candidates if Path(name).suffix.lower() in ARCHIVE_SUFFIXES]
+        if download.is_dir() and nested and not platform.archive_is_the_rom:
+            reason += f"; archive inside download directory cannot be imported: {nested[0]}"
+        return [ImportResult(False, None, reason)]
 
     results: list[ImportResult] = []
     for chosen in chosen_sets:
@@ -666,7 +705,9 @@ def import_rom(download: Path, platform: Platform, library_root: Path, *,
                         raise ValueError("empty ROM payload")
                     if platform.slug in ("ps2", "ngc", "xbox") and actual_size < 8 * 1024 * 1024:
                         raise ValueError(f"too small to be a {platform.name} disc image ({actual_size // (1024*1024)}MB < 8MB)")
-                    _publish_staged(staged, destination, overwrite)
+                    reason = _publish_import(staged, destination, overwrite=overwrite)
+                    if reason:
+                        raise ValueError(reason)
             except (OSError, ValueError, zipfile.BadZipFile, RuntimeError, subprocess.SubprocessError) as exc:
                 results.append(ImportResult(False, destination, f"copy/extraction or publication failed: {exc}"))
                 continue
@@ -702,13 +743,9 @@ def import_rom(download: Path, platform: Platform, library_root: Path, *,
                 total_set_size = sum(p.stat().st_size for p in staged_dir.iterdir())
                 if platform.slug in ("ps2", "ngc", "xbox") and total_set_size < 8 * 1024 * 1024:
                     raise ValueError(f"too small to be a {platform.name} disc image ({total_set_size // (1024*1024)}MB < 8MB)")
-                destination.mkdir(parents=True, exist_ok=True)
-                for name in written:
-                    final = destination / name
-                    if final.exists() and final.stat().st_size == 0:
-                        raise ValueError(f"existing zero-byte destination needs inspection: {final}")
-                for name in written:
-                    _publish_staged(staged_dir / name, destination / name, overwrite)
+                reason = _publish_import(staged_dir, destination, overwrite=overwrite)
+                if reason:
+                    raise ValueError(reason)
         except (OSError, ValueError, zipfile.BadZipFile, RuntimeError, subprocess.SubprocessError) as exc:
             results.append(ImportResult(False, destination, f"set copy/extraction or publication failed: {exc}; reconcile any completed members before retrying"))
             continue

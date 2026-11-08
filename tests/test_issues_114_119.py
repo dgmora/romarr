@@ -260,10 +260,17 @@ def test_issue_117_size_floor_8mib_scoring_and_import(tmp_path):
 # Issue #118: ROM Hub search drops irrelevant MiNERVA rows
 # ==============================================================================
 
-def test_issue_118_hub_search_filters_collection_paths(monkeypatch):
+@pytest.mark.parametrize("authenticated", [False, True])
+def test_issue_118_hub_search_filters_collection_paths(monkeypatch, authenticated):
     import sys
     import types
     import romarr.hub as hub
+    import romarr.ia_session as ia_session
+    import romarr.ia_auth as ia_auth
+    monkeypatch.setattr(ia_auth, "status", lambda _: {
+        "configured": authenticated, "error": ""})
+    transport = object()
+    monkeypatch.setattr(ia_session, "archive_transport", lambda *a: transport)
 
     class DummyResult:
         def __init__(self, title, path, plugin="minerva-archive"):
@@ -281,19 +288,20 @@ def test_issue_118_hub_search_filters_collection_paths(monkeypatch):
     class FakePlugin:
         enabled = True
         manifest = type("M", (), {"capabilities": ("search",)})()
-        slug = "minerva-archive"
+        def __init__(self, slug):
+            self.slug = slug
 
     class FakeRegistry:
         def __init__(self, *a, **kw): pass
         def installed(self):
-            return [FakePlugin()]
+            return [FakePlugin("minerva-archive"), FakePlugin("archive-org")]
 
     fake_root = types.ModuleType("rom_hub")
     fake_registry = types.ModuleType("rom_hub.registry")
     fake_registry.Registry = FakeRegistry
 
     class FakeFetcher:
-        def __init__(self, *a, **kw): pass
+        def __init__(self, *a, **kw): self.transport = kw.get("transport")
         def close(self): pass
 
     fake_broker = types.ModuleType("rom_hub.broker")
@@ -301,7 +309,15 @@ def test_issue_118_hub_search_filters_collection_paths(monkeypatch):
     fake_fetcher_mod.HttpxFetcher = FakeFetcher
 
     fake_disp = types.ModuleType("rom_hub.dispatcher")
-    fake_disp.search_all = lambda *a, **kw: DummyOutcome()
+    calls = []
+    def search_all(plugins, **kwargs):
+        calls.append(([p.slug for p in plugins], kwargs["fetcher"].transport))
+        assert kwargs["limit"] == 100
+        return types.SimpleNamespace(results=[
+            DummyResult(row._d["title"], row._d["extra"]["path"], plugin.slug)
+            for plugin in plugins for row in DummyOutcome.results
+        ] * 2)
+    fake_disp.search_all = search_all
 
     fake_root.registry = fake_registry
     fake_root.broker = fake_broker
@@ -314,11 +330,13 @@ def test_issue_118_hub_search_filters_collection_paths(monkeypatch):
     monkeypatch.setitem(sys.modules, "rom_hub.broker.fetcher", fake_fetcher_mod)
     monkeypatch.setitem(sys.modules, "rom_hub.dispatcher", fake_disp)
 
-    rows, err = hub.search("game", platform="ps2", limit=25)
+    rows, err = hub.search("game", platform="ps2", limit=1)
     assert err == ""
-    # Only Game 2 (PS2) survives; Mega Drive and TI-82 are filtered out!
-    assert len(rows) == 1
-    assert rows[0]["title"] == "Game 2 (PS2 ISO)"
+    assert len(rows) == 2
+    assert {row["plugin"] for row in rows} == {"minerva-archive", "archive-org"}
+    assert all(row["title"] == "Game 2 (PS2 ISO)" for row in rows)
+    assert calls == ([(["minerva-archive"], None), (["archive-org"], transport)]
+                     if authenticated else [(["minerva-archive", "archive-org"], None)])
 
 
 # ==============================================================================
