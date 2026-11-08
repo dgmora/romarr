@@ -263,3 +263,39 @@ def test_failed_qbit_login_is_reported_instead_of_an_empty_torrent_list(
     result = svc._collection_source_plan(
         "q1", "a" * 40, "Test System", "snes", 8 * 1024 * 1024)
     assert "authentication failed" in result["error"]
+
+
+def test_transmission_source_cancel_restores_selection_priorities_and_pause(tmp_path, monkeypatch):
+    from romarr.downloaders import Transmission, TransmissionConfig
+
+    svc = _service(tmp_path, monkeypatch)
+    source = tmp_path / "transmission-source"
+    source.mkdir()
+    (source / "Game (USA).zip").write_bytes(b"source")
+    client = Transmission(TransmissionConfig(base_url="http://transmission"))
+    client.romarr_id = "t1"
+    state = {"paused": True, "wanted": True, "priority": -1}
+    client.torrents = lambda: [{"hash": "a" * 40, "name": "Set", "save_path": str(source),
+                                "state": "pausedDL" if state["paused"] else "downloading"}]
+    client.torrent_files = lambda _: [{"index": 0, "name": "Game (USA).zip", "size": 6,
+                                       "progress": 1.0, "priority": (2 if state["priority"] == -1 else 1)
+                                       if state["wanted"] else 0,
+                                       "native_priority": state["priority"]}]
+    def select(_, values):
+        value = values[0]
+        state["wanted"] = value != 0
+        if value:
+            state["priority"] = -1 if value == 2 else 0
+        return True
+    def native(_, values):
+        state["priority"] = values[0]
+        return True
+    client.set_file_priorities = select
+    client.restore_native_priorities = native
+    client.pause_torrent = lambda _: state.update(paused=True) or True
+    client.resume_torrent = lambda _: state.update(paused=False) or True
+    svc.clients = [client]
+    started = svc.collection_source_start("t1", "a" * 40, "Test System", "snes", 8 * 1024 * 1024)
+    assert started["ok"] and state == {"paused": False, "wanted": True, "priority": 0}
+    assert svc.collection_source_control(started["id"], "cancel")["status"] == "cancelled"
+    assert state == {"paused": True, "wanted": True, "priority": -1}

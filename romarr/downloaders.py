@@ -618,6 +618,38 @@ class Transmission:
         return True
 
 
+    def torrents(self) -> list[dict]:
+        body = self._call("torrent-get", {"fields": ["hashString", "name", "downloadDir",
+                          "labels", "status", "totalSize", "pieceSize", "percentDone"]})
+        if body.get("result") != "success":
+            raise RuntimeError("Transmission could not list torrents")
+        states = {0: "pausedDL", 1: "queuedDL", 2: "checkingDL", 3: "queuedDL",
+                  4: "downloading", 5: "queuedUP", 6: "uploading"}
+        return [{"hash": str(row.get("hashString") or "").lower(),
+                 "name": row.get("name", ""), "save_path": row.get("downloadDir", ""),
+                 "state": states.get(row.get("status"), "unknown"),
+                 "size": row.get("totalSize", 0), "piece_size": row.get("pieceSize", 0),
+                 "progress": row.get("percentDone", 0),
+                 "category": self._config.category if self._config.category in row.get("labels", []) else ""}
+                for row in body.get("arguments", {}).get("torrents", [])]
+
+    def pause_torrent(self, torrent_hash: str) -> bool:
+        if self._call("torrent-stop", {"ids": [torrent_hash]}).get("result") != "success":
+            return False
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            body = self._call("torrent-get", {"ids": [torrent_hash], "fields": ["hashString", "status"]})
+            rows = body.get("arguments", {}).get("torrents", [])
+            if (body.get("result") == "success" and len(rows) == 1
+                    and str(rows[0].get("hashString") or "").lower() == torrent_hash.lower()
+                    and rows[0].get("status") == 0):
+                return True
+            time.sleep(0.1)
+        return False
+
+    def resume_torrent(self, torrent_hash: str) -> bool:
+        return self._call("torrent-start", {"ids": [torrent_hash]}).get("result") == "success"
+
     def torrent_files(self, torrent_hash: str) -> list[dict]:
         body = self._call("torrent-get", {"ids": [torrent_hash],
                           "fields": ["hashString", "files", "fileStats"]})
@@ -635,7 +667,7 @@ class Transmission:
             priority = {-1: 2, 0: 1, 1: 6}[int(stat["priority"])] if stat["wanted"] else 0
             out.append({"index": index, "name": item["name"], "size": size,
                         "progress": completed / size if size else 1.0,
-                        "priority": priority})
+                        "priority": priority, "native_priority": int(stat["priority"])})
         return out
 
     def set_file_priorities(self, torrent_hash: str, priorities: dict[int, int]) -> bool:
@@ -650,6 +682,16 @@ class Transmission:
         wanted = [index for index, priority in priorities.items() if priority != 0]
         if wanted:
             args["files-wanted"] = wanted
+        return self._call("torrent-set", args).get("result") == "success"
+
+    def restore_native_priorities(self, torrent_hash: str, priorities: dict[int, int]) -> bool:
+        args = {"ids": [torrent_hash]}
+        for priority, key in ((-1, "priority-low"), (0, "priority-normal"), (1, "priority-high")):
+            indexes = [index for index, value in priorities.items() if value == priority]
+            if indexes:
+                args[key] = indexes
+        if any(value not in (-1, 0, 1) for value in priorities.values()):
+            raise ValueError("invalid saved Transmission priority")
         return self._call("torrent-set", args).get("result") == "success"
 
     def completed(self) -> list[dict]:

@@ -77,7 +77,7 @@ In Docker the DAT directory needs its own bind mount, for example `/srv/dats:/da
 - **Bad dump:** at least one member conflicts with a known dump. Manual Import refuses it unless you explicitly choose Import anyway. Completed-download imports record the verdict and can keep the file; verified-only workflows refuse it.
 - **Unknown:** at least one member is not identified, with no conflicting member. This prevents the set from being verified and is common with homebrew and translations.
 
-Open **Collections**, choose the DAT and platform, and preview the comparison to see what is missing. A missing entry is a comparison result; downloading it still needs a usable source. Selective set-torrent acquisition also needs an existing qBittorrent torrent and a staging budget.
+Open **Collections**, choose the DAT and platform, and preview the comparison to see what is missing. A missing entry is a comparison result; downloading it still needs a usable source. Selective set-torrent acquisition also needs an existing qBittorrent or Transmission torrent and a staging budget.
 
 ## Paths that need to agree
 

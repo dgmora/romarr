@@ -3419,7 +3419,7 @@ class ROMarr:
 
     def _source_client(self, client_id: str = ""):
         clients = [c for c in self.clients
-                   if isinstance(c, QBittorrent)]
+                   if isinstance(c, QBittorrent) or type(c) is Transmission]
         if client_id:
             return next((c for c in clients
                          if getattr(c, "romarr_id", "") == client_id), None)
@@ -3428,13 +3428,13 @@ class ROMarr:
     def collection_source_torrents(self) -> dict:
         rows, errors = [], []
         for client in self.clients:
-            if not isinstance(client, QBittorrent):
+            if not isinstance(client, QBittorrent) and type(client) is not Transmission:
                 continue
             try:
                 for torrent in client.torrents():
                     rows.append({
                         "client_id": getattr(client, "romarr_id", ""),
-                        "client_name": getattr(client, "romarr_name", "qBittorrent"),
+                        "client_name": getattr(client, "romarr_name", client.name),
                         "hash": str(torrent.get("hash") or ""),
                         "name": str(torrent.get("name") or ""),
                         "size": int(torrent.get("size") or 0),
@@ -3444,7 +3444,7 @@ class ROMarr:
             except Exception as err:  # noqa: BLE001 - report client status to UI
                 detail = ("authentication failed" if isinstance(err, QbitAuthenticationError)
                           else err.__class__.__name__)
-                name = getattr(client, "romarr_name", "qBittorrent")
+                name = getattr(client, "romarr_name", client.name)
                 log.warning("could not list collection torrents from %s: %s", name, detail)
                 errors.append(f"{name}: {detail}")
         return {"torrents": rows, "errors": errors,
@@ -3457,7 +3457,7 @@ class ROMarr:
 
         client = self._source_client(client_id)
         if client is None:
-            return {"error": "select one configured qBittorrent client"}
+            return {"error": "select one configured torrent client"}
         try:
             torrent = next((t for t in client.torrents()
                             if str(t.get("hash") or "").lower()
@@ -3481,7 +3481,7 @@ class ROMarr:
             return result
         result.update({
             "client_id": getattr(client, "romarr_id", ""),
-            "client_name": getattr(client, "romarr_name", "qBittorrent"),
+            "client_name": getattr(client, "romarr_name", client.name),
             "torrent_hash": torrent_hash,
             "torrent_name": str(torrent.get("name") or ""),
             "dat": plan["dat"], "platform": platform,
@@ -3511,7 +3511,7 @@ class ROMarr:
         platform = selected_platform.slug
         client = self._source_client(client_id)
         if client is None:
-            return {"error": "select one configured qBittorrent client"}
+            return {"error": "select one configured torrent client"}
         client_key = getattr(client, "romarr_id", "")
         for existing in self.store.list_items("collection_sources"):
             if (existing.get("client_id") == client_key
@@ -3532,7 +3532,7 @@ class ROMarr:
                 torrent.get("save_path") or torrent.get("content_path") or "",
                 self.store.settings.get("remote_path_mappings"))
             if not source_root or not Path(source_root).is_dir():
-                return {"error": "qBittorrent source path is not mounted here"}
+                return {"error": "torrent source path is not mounted here"}
             stage_root = self.library / ".romarr-collection-spool"
             stage_root.mkdir(parents=True, exist_ok=True)
             free = shutil.disk_usage(stage_root).free
@@ -3550,6 +3550,8 @@ class ROMarr:
                 "dat": plan["dat"], "cap_bytes": int(plan["cap_bytes"]),
                 "reserve_bytes": int(plan["reserve_bytes"]),
                 "original_priorities": original, "was_paused": was_paused,
+                "original_native_priorities": ({str(f["index"]): f["native_priority"] for f in listing}
+                                               if type(client) is Transmission else {}),
                 "batches": plan["batches"], "batch": 0, "status": "running",
                 "started": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "errors": [],
@@ -3606,14 +3608,18 @@ class ROMarr:
         if not force and all(current.get(i) == p for i, p in expected.items()):
             return True
         if not client.pause_torrent(job["torrent_hash"]):
-            raise RuntimeError("qBittorrent refused to pause before file selection")
+            raise RuntimeError("torrent client refused to pause before file selection")
         if not client.set_file_priorities(job["torrent_hash"], priorities):
-            raise RuntimeError("qBittorrent refused to deselect unwanted files")
+            raise RuntimeError("torrent client refused to deselect unwanted files")
         if not client.set_file_priorities(job["torrent_hash"],
                                           {i: 1 for i in wanted}):
-            raise RuntimeError("qBittorrent refused to select planned files")
+            raise RuntimeError("torrent client refused to select planned files")
+        verified = {int(f["index"]): int(f.get("priority") or 0)
+                    for f in client.torrent_files(job["torrent_hash"])}
+        if verified != expected:
+            raise RuntimeError("torrent client did not apply the planned selection")
         if not client.resume_torrent(job["torrent_hash"]):
-            raise RuntimeError("qBittorrent refused to resume selected files")
+            raise RuntimeError("torrent client refused to resume selected files")
         return True
 
     def collection_source_step(self, job_id: str) -> dict:
@@ -3627,7 +3633,7 @@ class ROMarr:
             return self._source_job_progress(job)
         client = self._source_client(job.get("client_id", ""))
         if client is None:
-            return {"error": "the qBittorrent client for this batch is unavailable"}
+            return {"error": "the torrent client for this batch is unavailable"}
         batch_index = int(job.get("batch") or 0)
         batches = job.get("batches") or []
         if batch_index >= len(batches):
@@ -3666,7 +3672,7 @@ class ROMarr:
                 for planned in group.get("files") or []:
                     rel = PurePosixPath(str(planned["name"]))
                     if rel.is_absolute() or ".." in rel.parts:
-                        raise ValueError("qBittorrent returned an unsafe file path")
+                        raise ValueError("torrent client returned an unsafe file path")
                     source = (Path(job["save_path"]) / Path(*rel.parts)).resolve(strict=True)
                     source.relative_to(Path(job["save_path"]).resolve())
                     dest = game_dir / Path(*rel.parts)
@@ -3724,6 +3730,15 @@ class ROMarr:
                         (job.get("original_priorities") or {}).items()}
             if not client.set_file_priorities(job["torrent_hash"], original):
                 return False
+            native = job.get("original_native_priorities") or {}
+            if native and not client.restore_native_priorities(
+                    job["torrent_hash"], {int(i): int(p) for i, p in native.items()}):
+                return False
+            files = client.torrent_files(job["torrent_hash"])
+            if {int(f["index"]): int(f.get("priority") or 0) for f in files} != original:
+                return False
+            if native and {str(f["index"]): f.get("native_priority") for f in files} != native:
+                return False
             if not job.get("was_paused") and not client.resume_torrent(job["torrent_hash"]):
                 return False
             return True
@@ -3739,7 +3754,7 @@ class ROMarr:
         if action == "cancel" and job.get("status") == "running":
             client = self._source_client(job.get("client_id", ""))
             if client is None:
-                return {"error": "the qBittorrent client for this batch is unavailable"}
+                return {"error": "the torrent client for this batch is unavailable"}
             restored = self._restore_source_priorities(client, job)
             if restored:
                 job["status"] = "cancelled"
@@ -3750,7 +3765,7 @@ class ROMarr:
         elif action == "restore":
             client = self._source_client(job.get("client_id", ""))
             if client is None:
-                return {"error": "the qBittorrent client for this batch is unavailable"}
+                return {"error": "the torrent client for this batch is unavailable"}
             restored = self._restore_source_priorities(client, job)
             if restored:
                 job["status"] = job.pop("restore_status", "cancelled")

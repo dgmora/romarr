@@ -69,8 +69,8 @@ def test_transmission_file_stats_are_normalized_and_selections_are_explicit():
         "fileStats": [{"bytesCompleted": 100, "wanted": True, "priority": -1},
                       {"bytesCompleted": 50, "wanted": False, "priority": 1}]}]}})
     assert c.torrent_files(HASH) == [
-        {"index": 0, "name": "Set/A.bin", "size": 100, "progress": 1.0, "priority": 2},
-        {"index": 1, "name": "Set/B.bin", "size": 200, "progress": 0.25, "priority": 0}]
+        {"index": 0, "name": "Set/A.bin", "size": 100, "progress": 1.0, "priority": 2, "native_priority": -1},
+        {"index": 1, "name": "Set/B.bin", "size": 200, "progress": 0.25, "priority": 0, "native_priority": 1}]
     c._call.return_value = {"result": "success"}
     assert c.set_file_priorities(HASH, {0: 2, 1: 0})
     assert c._call.call_args.args == ("torrent-set", {"ids": [HASH], "files-unwanted": [1],
@@ -81,3 +81,13 @@ def test_transmission_rejects_unrepresentable_priority():
     c = client()
     with pytest.raises(ValueError, match="cannot represent"):
         c.set_file_priorities(HASH, {0: 7})
+
+
+def test_transmission_waits_for_stop_before_selection(monkeypatch):
+    c = client()
+    c._call = Mock(side_effect=[{"result": "success"},
+        {"result": "success", "arguments": {"torrents": [{"hashString": HASH, "status": 4}]}},
+        {"result": "success", "arguments": {"torrents": [{"hashString": HASH, "status": 0}]}}])
+    monkeypatch.setattr("romarr.downloaders.time.sleep", lambda _: None)
+    assert c.pause_torrent(HASH)
+    assert [call.args[0] for call in c._call.call_args_list] == ["torrent-stop", "torrent-get", "torrent-get"]
