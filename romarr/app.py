@@ -3541,7 +3541,7 @@ class ROMarr:
             listing = client.torrent_files(torrent_hash)
             original = {str(int(f.get("index"))): int(f.get("priority") or 0)
                         for f in listing if f.get("index") is not None}
-            was_paused = "paused" in str(torrent.get("state") or "").lower()
+            was_paused = str(torrent.get("state") or "").lower().startswith(("paused", "stopped"))
             job_id = uuid.uuid4().hex[:12]
             job = {
                 "id": job_id, "client_id": getattr(client, "romarr_id", ""),
@@ -3550,6 +3550,7 @@ class ROMarr:
                 "dat": plan["dat"], "cap_bytes": int(plan["cap_bytes"]),
                 "reserve_bytes": int(plan["reserve_bytes"]),
                 "original_priorities": original, "was_paused": was_paused,
+                "source_files": {str(f["index"]): [f["name"], f["size"]] for f in listing},
                 "original_native_priorities": ({str(f["index"]): f["native_priority"] for f in listing}
                                                if type(client) is Transmission else {}),
                 "batches": plan["batches"], "batch": 0, "status": "running",
@@ -3595,6 +3596,7 @@ class ROMarr:
         if index >= len(batches):
             return False
         files = client.torrent_files(job["torrent_hash"])
+        self._check_source_selection(job, files)
         ids = {int(f["index"]) for f in files if f.get("index") is not None}
         priorities = {i: 0 for i in ids}
         wanted = {int(f["index"])
@@ -3609,9 +3611,19 @@ class ROMarr:
             return True
         if not client.pause_torrent(job["torrent_hash"]):
             raise RuntimeError("torrent client refused to pause before file selection")
-        if not client.set_file_priorities(job["torrent_hash"], priorities):
+        self._check_source_selection(job, client.torrent_files(job["torrent_hash"]))
+        job["applied_priorities"] = {str(i): p for i, p in expected.items()}
+        if type(client) is Transmission:
+            job["applied_native_priorities"] = {
+                str(f["index"]): 0 if int(f["index"]) in wanted else f["native_priority"]
+                for f in files}
+        self.store.put_item("collection_sources", job)
+        if type(client) is Transmission:
+            if not client.set_file_priorities(job["torrent_hash"], expected):
+                raise RuntimeError("Transmission refused the planned selection")
+        elif not client.set_file_priorities(job["torrent_hash"], priorities):
             raise RuntimeError("torrent client refused to deselect unwanted files")
-        if not client.set_file_priorities(job["torrent_hash"],
+        if type(client) is not Transmission and not client.set_file_priorities(job["torrent_hash"],
                                           {i: 1 for i in wanted}):
             raise RuntimeError("torrent client refused to select planned files")
         verified = {int(f["index"]): int(f.get("priority") or 0)
@@ -3722,10 +3734,29 @@ class ROMarr:
             self.store.put_item("collection_sources", job)
             return {"error": job["errors"][0], **self._source_job_progress(job)}
 
+    @staticmethod
+    def _check_source_selection(job, files, *, restoring=False):
+        identities = {str(f["index"]): [f["name"], f["size"]] for f in files}
+        if job.get("source_files") and identities != job["source_files"]:
+            raise ValueError("source file identity changed; review the torrent before retrying")
+        current = {str(f["index"]): int(f.get("priority") or 0) for f in files}
+        expected = job.get("applied_priorities", job.get("original_priorities"))
+        if (expected is not None and current != expected
+                and not (restoring and current == job.get("original_priorities"))):
+            raise ValueError("source selection changed outside this job; review before restoring")
+        native = job.get("applied_native_priorities", job.get("original_native_priorities"))
+        if native:
+            current_native = {str(f["index"]): f.get("native_priority") for f in files}
+            if (current_native != native and not (restoring and
+                    current_native == job.get("original_native_priorities"))):
+                raise ValueError("source native priorities changed outside this job; review before restoring")
+
     def _restore_source_priorities(self, client, job: dict) -> bool:
         try:
+            self._check_source_selection(job, client.torrent_files(job["torrent_hash"]), restoring=True)
             if not client.pause_torrent(job["torrent_hash"]):
                 return False
+            self._check_source_selection(job, client.torrent_files(job["torrent_hash"]), restoring=True)
             original = {int(i): int(p) for i, p in
                         (job.get("original_priorities") or {}).items()}
             if not client.set_file_priorities(job["torrent_hash"], original):
@@ -3743,6 +3774,7 @@ class ROMarr:
                 return False
             return True
         except Exception as err:  # noqa: BLE001
+            job["errors"] = [f"could not restore source selection: {err}"]
             log.warning("could not restore source torrent priorities: %s",
                         err.__class__.__name__)
             return False

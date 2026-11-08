@@ -299,3 +299,23 @@ def test_transmission_source_cancel_restores_selection_priorities_and_pause(tmp_
     assert started["ok"] and state == {"paused": False, "wanted": True, "priority": 0}
     assert svc.collection_source_control(started["id"], "cancel")["status"] == "cancelled"
     assert state == {"paused": True, "wanted": True, "priority": -1}
+
+
+def test_external_selection_change_is_preserved_on_step_and_cancel(tmp_path, monkeypatch):
+    svc = _service(tmp_path, monkeypatch)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "Game (USA).zip").write_bytes(b"source")
+    client = FakeQbit(source)
+    svc.clients = [client]
+    started = svc.collection_source_start("q1", "a" * 40, "Test System", "snes", 8 * 1024 * 1024)
+    assert started["ok"]
+    client.priorities[0] = 7
+    calls = list(client.priority_calls)
+    result = svc.collection_source_step(started["id"])
+    assert "selection changed" in result["error"]
+    result = svc.collection_source_control(started["id"], "cancel")
+    assert result["status"] == "restore-needed"
+    assert "selection changed" in result["errors"][0]
+    assert client.priorities == {0: 7}
+    assert client.priority_calls == calls
