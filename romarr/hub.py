@@ -472,13 +472,15 @@ def search(query: str, platform: str | None = None, limit: int = 25,
             transport = archive_transport(auth_slug, HOME) if auth_slug else None
             fetcher = HttpxFetcher(timeout=max(60.0, timeout), transport=transport)
         except Exception as exc:
-            return rows, f"Archive.org authentication setup failed: {type(exc).__name__}: {exc}"
+            auth_error = f"Archive.org authentication setup failed: {type(exc).__name__}: {exc}"
+            continue
         try:
             outcome = search_all(group, fetcher=fetcher, query=query,
                                  platform=platform, limit=call_limit, timeout=timeout,
                                  allow_unsandboxed=_unsandboxed())
         except Exception as exc:
-            return rows, f"ROM Hub search failed: {type(exc).__name__}: {exc}"
+            auth_error = f"ROM Hub search failed: {type(exc).__name__}: {exc}"
+            continue
         finally:
             fetcher.close()
         for r in outcome.results:

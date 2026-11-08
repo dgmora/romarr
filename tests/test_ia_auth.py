@@ -147,3 +147,33 @@ def test_romarr_auth_settings_use_shared_store(root, monkeypatch):
     assert credentials(root) == ("account@example.com", "secret-password")
     assert hub.archive_org_auth_configure(clear=True)["ok"]
     assert hub.archive_org_auth_status()["configured"] is False
+
+
+@pytest.mark.parametrize("failure", ["setup", "search"])
+def test_authenticated_search_failure_preserves_anonymous_filtering(root, monkeypatch, failure):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from romarr import hub
+
+    monkeypatch.setattr(hub, "HOME", root)
+    assert configure(root, "account@example.com", "secret-password")["ok"]
+    plugins = [SimpleNamespace(slug=slug, enabled=True, manifest=SimpleNamespace(capabilities=["search"]))
+               for slug in ("anonymous", "archive-org")]
+    monkeypatch.setattr("rom_hub.registry.Registry.installed", lambda self: plugins)
+    monkeypatch.setattr(hub, "_unsandboxed", lambda: False)
+    monkeypatch.setattr("rom_hub.broker.fetcher.HttpxFetcher", Mock())
+    rows = [dict(plugin="anonymous", title="Wrong.nes", extra={"path": "NES/Wrong.nes"}),
+            dict(plugin="anonymous", title="First.sfc", extra={"path": "SNES/First.sfc"}),
+            dict(plugin="anonymous", title="Second.sfc", extra={"path": "SNES/Second.sfc"})]
+    def transport(slug, home):
+        if failure == "setup":
+            raise RuntimeError("unavailable")
+    def search(group, **kwargs):
+        if group[0].slug == "archive-org":
+            raise RuntimeError("unavailable")
+        return SimpleNamespace(results=rows)
+    monkeypatch.setattr("romarr.ia_session.archive_transport", transport)
+    monkeypatch.setattr("rom_hub.dispatcher.search_all", search)
+    results, error = hub.search("Game", platform="snes", limit=1)
+    assert [row["title"] for row in results] == ["First.sfc"]
+    assert "unavailable" in error
