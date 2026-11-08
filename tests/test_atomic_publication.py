@@ -46,13 +46,15 @@ def test_failed_copy_publishes_nothing_and_cleans_scratch(tmp_path):
     assert not (library/"psx/Demo").exists()
     assert not list(library.rglob(".romarr-import-*"))
 
-def test_empty_directory_can_be_reused_but_existing_set_is_preserved(tmp_path):
+def test_empty_directory_can_be_reused_and_existing_set_overwritten(tmp_path):
     source=disc(tmp_path); library=tmp_path/"library"; target=library/"psx/Demo"
     target.mkdir(parents=True)
     assert import_rom(source,resolve("psx"),library)[0].ok
     (target/"Demo.bin").write_bytes(b"original")
-    assert not import_rom(source,resolve("psx"),library,overwrite=True)[0].ok
-    assert (target/"Demo.bin").read_bytes()==b"original"
+    (target/"extra.txt").write_text("keep")
+    assert import_rom(source,resolve("psx"),library,overwrite=True)[0].ok
+    assert (target/"Demo.bin").read_bytes()==(source/"Demo.bin").read_bytes()
+    assert (target/"extra.txt").read_text()=="keep"
 
 def test_custom_platform_folder(tmp_path):
     source=disc(tmp_path); library=tmp_path/"library"

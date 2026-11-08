@@ -572,14 +572,18 @@ def _publish_import(staged: Path, destination: Path, *, overwrite: bool) -> str:
             return "refusing to replace a symlink destination"
         if staged.is_dir():
             if destination.exists():
-                # Sender cleanup can leave an empty disc directory. rmdir is
-                # atomic and refuses files, symlinks and nonempty directories.
+                if overwrite and destination.is_dir() and any(destination.iterdir()):
+                    for member in staged.iterdir():
+                        final = destination / member.name
+                        if final.exists() and final.stat().st_size == 0:
+                            raise ValueError(f"existing zero-byte destination needs inspection: {final}")
+                    for member in staged.iterdir():
+                        _publish_staged(member, destination / member.name, overwrite=True)
+                    return ""
                 try:
                     destination.rmdir()
                 except OSError:
-                    return ("cannot atomically replace an existing disc directory; "
-                            "move it aside before importing" if overwrite
-                            else "already in the library")
+                    return "already in the library"
             staged.rename(destination)
         elif overwrite:
             if destination.is_dir():

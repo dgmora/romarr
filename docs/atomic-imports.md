@@ -8,9 +8,9 @@ layouts, translations, custom platform folders and DAT renaming remain supported
 
 Single files use exclusive hardlink publication, or atomic replacement when
 explicit overwrite is requested. A complete directory is published by rename.
-Empty directories can be reused; nonempty disc directories and symlink destinations
-are preserved. Atomic replacement of a nonempty directory is not portable, so even
-an explicit overwrite request fails with instructions to move that set aside first.
+Empty directories can be reused. With explicit overwrite, an existing nonempty
+directory is updated one member at a time, preserving unrelated files; readers
+may observe the replacement in progress. Symlink destinations are refused.
 
 Handled copy failures clean unpublished scratch. A hard process interruption can
 leave scratch behind; this change alone does not add startup or age-based cleanup.
