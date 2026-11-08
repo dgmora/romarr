@@ -521,7 +521,15 @@ class Transmission:
         self._config = config
         self._session = session or requests.Session()
         self._session_id = ""
-        self.last_job_id = ""
+        self._added = threading.local()
+
+    @property
+    def last_job_id(self):
+        return getattr(self._added, "job_id", "")
+
+    @last_job_id.setter
+    def last_job_id(self, value):
+        self._added.job_id = value
 
     @property
     def configured(self) -> bool:
@@ -3484,6 +3492,11 @@ def match_queue_item(queue, download: dict):
     rows without a comparable identity can still match an exact release
     title, but file size never establishes identity.
     """
+    client_id = str(getattr(download.get("_romarr_client"), "romarr_id", "") or "")
+    if client_id:
+        queue = [item for item in queue
+                 if not getattr(item, "download_client", "")
+                 or item.download_client == client_id]
     tags = {part.strip() for part in str(download.get("tags") or "").split(",")
             if part.strip()}
     tag_matches = [item for item in queue

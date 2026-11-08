@@ -2211,7 +2211,7 @@ class ROMarr:
                 continue
             candidates = (client.selective_completed([item], ownership=self._retained_owners()) if isinstance(client, QBittorrent) else [])
             for candidate in candidates + client.completed():
-                if match_queue_item([item], candidate) is item:
+                if match_queue_item([item], dict(candidate, _romarr_client=client)) is item:
                     torrent = candidate
                     source_client = client
                     break
@@ -2823,7 +2823,7 @@ class ROMarr:
                 completed = getattr(client, "completed", None)
                 if callable(completed):
                     for item in completed():
-                        if match_queue_item([row], item) is not None:
+                        if match_queue_item([row], dict(item, _romarr_client=client)) is not None:
                             return True
             except Exception:
                 pass
@@ -2832,7 +2832,7 @@ class ROMarr:
                              or getattr(client, "torrents", None))
                 if callable(active_fn):
                     for item in active_fn():
-                        if match_queue_item([row], item) is None:
+                        if match_queue_item([row], dict(item, _romarr_client=client)) is None:
                             continue
                         progress = float(item.get("progress", 0) or 0)
                         if progress >= 1.0:
@@ -2874,7 +2874,7 @@ class ROMarr:
             if callable(deleter) and callable(torrents_fn):
                 try:
                     for item in torrents_fn():
-                        if match_queue_item([row], item) is not None:
+                        if match_queue_item([row], dict(item, _romarr_client=client)) is not None:
                             thash = str(item.get("hash") or "").strip()
                             if thash and deleter(thash):
                                 removed = True

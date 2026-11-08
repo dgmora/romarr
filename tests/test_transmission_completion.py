@@ -42,3 +42,20 @@ def test_failed_submission_clears_previous_identity():
 def test_failed_polling_is_not_silently_reported_as_empty():
     c = client(); c._call = Mock(return_value={"result":"error"})
     with pytest.raises(RuntimeError): c.completed()
+
+
+def test_concurrent_submissions_keep_their_own_identity():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    c = client()
+    barrier = Barrier(2)
+    def call(method, arguments):
+        return {"result": "success", "arguments": {"torrent-added": {"hashString": arguments["filename"]}}}
+    c._call = call
+    def submit(identity):
+        assert c.add(identity)
+        barrier.wait()
+        return c.last_job_id
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(submit, ["a" * 40, "b" * 40])) == ["a" * 40, "b" * 40]

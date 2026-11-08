@@ -102,3 +102,20 @@ def test_request_tag_identifies_game_before_shared_pending_hash():
     first.download_id = "qbit-tag:first"
     second.download_id = "qbit-tag:second"
     assert match_queue_item([first, second], {"hash": HASH, "tags": "second"}) is second
+
+
+def test_completion_matches_only_its_configured_client():
+    first = row("A", "grabbed")
+    second = row("B", "grabbed")
+    first.download_client = "first"
+    second.download_client = "second"
+    client = type("Client", (), {"romarr_id": "second"})()
+    assert match_queue_item([first, second], {"hash": HASH, "_romarr_client": client}) is second
+
+
+def test_completion_does_not_claim_another_clients_legacy_title():
+    item = row("A", "grabbed")
+    item.download_client = "first"
+    item.download_id = item.release_id = ""
+    client = type("Client", (), {"romarr_id": "second"})()
+    assert match_queue_item([item], {"name": item.release, "_romarr_client": client}) is None
