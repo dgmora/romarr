@@ -91,3 +91,11 @@ def test_transmission_waits_for_stop_before_selection(monkeypatch):
     monkeypatch.setattr("romarr.downloaders.time.sleep", lambda _: None)
     assert c.pause_torrent(HASH)
     assert [call.args[0] for call in c._call.call_args_list] == ["torrent-stop", "torrent-get", "torrent-get"]
+
+
+def test_invalid_saved_native_priority_does_not_send_request():
+    c = client()
+    c._call = Mock()
+    with pytest.raises(ValueError, match="invalid saved"):
+        c.set_file_priorities(HASH, {0: 1}, native_priorities={0: 9})
+    c._call.assert_not_called()

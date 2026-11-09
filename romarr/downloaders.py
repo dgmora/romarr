@@ -670,7 +670,8 @@ class Transmission:
                         "priority": priority, "native_priority": int(stat["priority"])})
         return out
 
-    def set_file_priorities(self, torrent_hash: str, priorities: dict[int, int]) -> bool:
+    def set_file_priorities(self, torrent_hash: str, priorities: dict[int, int], *,
+                            native_priorities: dict[int, int] | None = None) -> bool:
         values = {0: "files-unwanted", 1: "priority-normal", 2: "priority-low", 6: "priority-high"}
         if any(value not in values for value in priorities.values()):
             raise ValueError("Transmission cannot represent the requested file priority")
@@ -682,16 +683,14 @@ class Transmission:
         wanted = [index for index, priority in priorities.items() if priority != 0]
         if wanted:
             args["files-wanted"] = wanted
-        return self._call("torrent-set", args).get("result") == "success"
-
-    def restore_native_priorities(self, torrent_hash: str, priorities: dict[int, int]) -> bool:
-        args = {"ids": [torrent_hash]}
-        for priority, key in ((-1, "priority-low"), (0, "priority-normal"), (1, "priority-high")):
-            indexes = [index for index, value in priorities.items() if value == priority]
-            if indexes:
-                args[key] = indexes
-        if any(value not in (-1, 0, 1) for value in priorities.values()):
-            raise ValueError("invalid saved Transmission priority")
+        if native_priorities is not None:
+            if any(value not in (-1, 0, 1) for value in native_priorities.values()):
+                raise ValueError("invalid saved Transmission priority")
+            for priority, key in ((-1, "priority-low"), (0, "priority-normal"), (1, "priority-high")):
+                args.pop(key, None)
+                indexes = [index for index, value in native_priorities.items() if value == priority]
+                if indexes:
+                    args[key] = indexes
         return self._call("torrent-set", args).get("result") == "success"
 
     def completed(self) -> list[dict]:

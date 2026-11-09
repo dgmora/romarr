@@ -281,17 +281,15 @@ def test_transmission_source_cancel_restores_selection_priorities_and_pause(tmp_
                                        "progress": 1.0, "priority": (2 if state["priority"] == -1 else 1)
                                        if state["wanted"] else 0,
                                        "native_priority": state["priority"]}]
-    def select(_, values):
+    def select(_, values, *, native_priorities=None):
         value = values[0]
         state["wanted"] = value != 0
         if value:
             state["priority"] = -1 if value == 2 else 0
-        return True
-    def native(_, values):
-        state["priority"] = values[0]
+        if native_priorities is not None:
+            state["priority"] = native_priorities[0]
         return True
     client.set_file_priorities = select
-    client.restore_native_priorities = native
     client.pause_torrent = lambda _: state.update(paused=True) or True
     client.resume_torrent = lambda _: state.update(paused=False) or True
     svc.clients = [client]
@@ -319,3 +317,96 @@ def test_external_selection_change_is_preserved_on_step_and_cancel(tmp_path, mon
     assert "selection changed" in result["errors"][0]
     assert client.priorities == {0: 7}
     assert client.priority_calls == calls
+
+
+@pytest.mark.parametrize("phase", ["prepare", "restore"])
+@pytest.mark.parametrize("failed_request_applied", [False, True])
+def test_qbit_partial_priority_update_can_restore_after_restart(
+        tmp_path, monkeypatch, phase, failed_request_applied):
+    svc = _service(tmp_path, monkeypatch)
+    client = FakeQbit(tmp_path)
+    client.priorities = {0: 6, 1: 1}
+    client.torrent_files = lambda _: [
+        {"index": i, "name": str(i), "size": 8, "priority": p}
+        for i, p in client.priorities.items()]
+    job = {"id": "recover", "torrent_hash": "a" * 40,
+           "original_priorities": {"0": 6, "1": 1}, "was_paused": False,
+           "batches": [{"groups": [{"files": [{"index": 0}]}]}]}
+    if phase == "restore":
+        svc._prepare_collection_source_batch(client, job, force=True)
+    calls = 0
+    original = client.set_file_priorities
+
+    def fail_second(torrent_hash, priorities):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            if failed_request_applied:
+                original(torrent_hash, priorities)
+            return False
+        return original(torrent_hash, priorities)
+
+    client.set_file_priorities = fail_second
+    if phase == "prepare":
+        with pytest.raises(RuntimeError, match="refused"):
+            svc._prepare_collection_source_batch(client, job, force=True)
+    else:
+        assert not svc._restore_source_priorities(client, job)
+    restarted = ROMarr(env={"ROMARR_DATA": str(tmp_path / "state.json"),
+                            "LIBRARY_PATH": str(tmp_path / "library")})
+    recovered = restarted.store.get_item("collection_sources", job["id"])
+    assert recovered["priority_transition"]
+    client.set_file_priorities = original
+    interrupted = dict(client.priorities)
+    client.priorities = {0: 7, 1: 0}
+    before = list(client.priority_calls)
+    assert not restarted._restore_source_priorities(client, recovered)
+    assert client.priorities == {0: 7, 1: 0}
+    assert client.priority_calls == before
+    client.priorities = interrupted
+    assert restarted._restore_source_priorities(client, recovered)
+    assert client.priorities == {0: 6, 1: 1}
+    assert client.resumes > 0
+    assert "priority_transition" not in recovered
+
+
+@pytest.mark.parametrize("request_applied", [False, True])
+@pytest.mark.parametrize("was_paused", [False, True])
+def test_transmission_restore_retries_one_combined_request(
+        tmp_path, monkeypatch, request_applied, was_paused):
+    from romarr.downloaders import Transmission, TransmissionConfig
+
+    svc = _service(tmp_path, monkeypatch)
+    client = Transmission(TransmissionConfig(base_url="http://transmission"))
+    state = {"wanted": [True, False], "native": [0, 1], "paused": False}
+    client.torrent_files = lambda _: [
+        {"index": i, "name": str(i), "size": 8,
+         "priority": ({-1: 2, 0: 1, 1: 6}[state["native"][i]] if state["wanted"][i] else 0),
+         "native_priority": state["native"][i]} for i in range(2)]
+    client.pause_torrent = lambda _: state.update(paused=True) or True
+    client.resume_torrent = lambda _: state.update(paused=False) or True
+    calls = []
+
+    def call(method, args):
+        calls.append((method, args))
+        if len(calls) > 1 or request_applied:
+            for i in args["files-wanted"]:
+                state["wanted"][i] = True
+            for i in args["files-unwanted"]:
+                state["wanted"][i] = False
+            for priority, key in ((-1, "priority-low"), (0, "priority-normal"), (1, "priority-high")):
+                for i in args.get(key, []):
+                    state["native"][i] = priority
+        return {"result": "failure" if len(calls) == 1 else "success"}
+
+    client._call = call
+    job = {"id": "recover", "torrent_hash": "a" * 40, "was_paused": was_paused,
+           "original_priorities": {"0": 2, "1": 0},
+           "original_native_priorities": {"0": -1, "1": 1},
+           "applied_priorities": {"0": 1, "1": 0},
+           "applied_native_priorities": {"0": 0, "1": 1}}
+    assert not svc._restore_source_priorities(client, job)
+    assert svc._restore_source_priorities(client, job)
+    assert calls == [("torrent-set", {"ids": ["a" * 40], "files-unwanted": [1],
+                      "files-wanted": [0], "priority-low": [0], "priority-high": [1]})] * 2
+    assert state == {"wanted": [True, False], "native": [-1, 1], "paused": was_paused}
