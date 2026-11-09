@@ -2305,20 +2305,24 @@ class ROMarr:
                 except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
                     return {"ok": False, "error": str(exc)}
                 return {"ok": bool(ok), "message": "Retained torrent resumed. Retry the pending grab." if ok else "Downloader refused to resume"}
-        if action == "retry" and not self._is_hub_row(item) and (item.import_intent or item.state in ("import-failed", "import-review")):
-            item.state = "grabbed"
-            self.store.save()
-            return {"ok": True, "import_retry": True}
-        with self._lock:
+        import_retry = action == "retry" and (item.import_intent or item.state in ("import-failed", "import-review"))
+        with self._lock, ExitStack() as guards:
             if self._is_hub_row(item):
                 expected = {k: getattr(item, k) for k in
                             ("at", "download_id", "download_client", "release")}
                 if identity != expected:
                     return {"ok": False, "error": "Queue changed; refresh before acting on this Hub job"}
                 try:
-                    self._dismiss_hub(item)
+                    if import_retry:
+                        guards.enter_context(self._hub_client_for(item).import_retry(item))
+                    else:
+                        self._dismiss_hub(item)
                 except (OSError, ValueError) as err:
                     return {"ok": False, "error": str(err)}
+            if import_retry:
+                item.state = "grabbed"
+                self.store.save()
+                return {"ok": True, "import_retry": True}
             self.queue = [q for q in self.queue if q is not item]
         if action == "retry":
             if self._is_hub_row(item) and item.external_request_id:

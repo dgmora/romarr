@@ -375,3 +375,37 @@ def test_explicit_id_must_belong_to_selected_release(tmp_path):
     before = c._read()
     assert not s.queue_action(0, "remove", identity(first))["ok"]
     assert c._read() == before
+
+
+@pytest.mark.parametrize("state", ["import-failed", "import-review"])
+def test_completed_hub_import_retry_preserves_review_and_release(tmp_path, monkeypatch, state):
+    s, c = setup(tmp_path)
+    q = grab(s)
+    rows = c._read()
+    rows[0].update(state="done", file=str(tmp_path / "complete.zip"))
+    c._write(rows)
+    q.state = state
+    q.import_intent = {"selected_primaries": ["chosen.cue"], "bundle_routes": {"chosen.cue": "Game"}}
+    before = (identity(q), dict(q.import_intent), c._read())
+    monkeypatch.setattr(s, "request", lambda *a, **kw: pytest.fail("new search"))
+    stale = {**identity(q), "at": "stale"}
+    assert not s.queue_action(0, "retry", stale)["ok"]
+    c._active.add(q.download_id)
+    assert not s.queue_action(0, "retry", identity(q))["ok"]
+    c._active.clear()
+    assert s.queue_action(0, "retry", identity(q)) == {"ok": True, "import_retry": True}
+    assert s.queue == [q] and q.state == "grabbed"
+    assert (identity(q), q.import_intent, c._read()) == before
+
+
+@pytest.mark.parametrize("ledger_state", ["pending", "failed"])
+def test_hub_import_retry_requires_completed_download(tmp_path, ledger_state):
+    s, c = setup(tmp_path)
+    q = grab(s)
+    rows = c._read()
+    rows[0]["state"] = ledger_state
+    c._write(rows)
+    q.state = "import-failed"
+    assert not s.queue_action(0, "retry", identity(q))["ok"]
+    assert s.queue == [q] and q.state == "import-failed"
+    assert c._read() == rows

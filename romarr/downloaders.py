@@ -3408,6 +3408,16 @@ class HubDownloader:
                                  "the download may be missing or its details may have changed")
             return dict(matches[0])
 
+    @contextmanager
+    def import_retry(self, item):
+        with self._lock:
+            job = self.job_for(item)
+            if job["id"] in self._active:
+                raise ValueError("Hub job is owned by an active fetch/import; try again after it finishes")
+            if job["id"] in self._unsaved or job.get("state") != "done":
+                raise ValueError("Hub download must be complete and persisted before retrying import")
+            yield
+
     def dismiss(self, item) -> None:
         with self._lock:
             job = self.job_for(item)
