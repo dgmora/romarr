@@ -60,3 +60,27 @@ def test_custom_platform_folder(tmp_path):
     source=disc(tmp_path); library=tmp_path/"library"
     result=import_rom(source,resolve("psx"),library,platform_folders={"psx":"PlayStation"})
     assert result[0].ok and (library/"PlayStation/Demo/Demo.bin").exists()
+
+
+@pytest.mark.parametrize("existing_empty", [False, True])
+def test_published_set_uses_library_directory_permissions(tmp_path, existing_empty):
+    import os
+    import stat
+
+    source = disc(tmp_path)
+    library = tmp_path / "library"
+    target = library / "psx" / "Demo"
+    target.parent.mkdir(parents=True)
+    previous = os.umask(0o002)
+    try:
+        reference = target.parent / "reference"
+        reference.mkdir()
+        if existing_empty:
+            target.mkdir()
+        result, = import_rom(source, resolve("psx"), library)
+    finally:
+        os.umask(previous)
+    assert result.ok
+    assert stat.S_IMODE(target.stat().st_mode) == stat.S_IMODE(reference.stat().st_mode)
+    assert target.stat().st_gid == reference.stat().st_gid
+    assert target.stat().st_mode & 0o070 == 0o070

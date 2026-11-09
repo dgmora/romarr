@@ -732,7 +732,8 @@ def import_rom(download: Path, platform: Platform, library_root: Path, *,
         target_dir.mkdir(parents=True, exist_ok=True)
         try:
             with tempfile.TemporaryDirectory(prefix=".romarr-import-", dir=target_dir) as staging:
-                staged_dir = Path(staging)
+                staged_dir = Path(staging) / "game"
+                staged_dir.mkdir()
                 written: dict[str, str] = {}
                 for member in chosen.members:
                     name = Path(member.replace("\\", "/")).name
