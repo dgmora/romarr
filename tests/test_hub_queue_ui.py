@@ -36,13 +36,20 @@ RENDER.queue=QUEUE;
 (async()=>{
  await RENDER.queue();
  assert.match($('#page').innerHTML,/metadata HTTP 503/);
- assert.match($('#page').innerHTML,/Search again/);
+ assert.match($('#page').innerHTML,/Retry/);
+ assert.doesNotMatch($('#page').innerHTML,/Preview import/);
  await retry.onclick();
  assert.equal(action.action,'retry');
  assert.deepEqual(action.identity,{at:'now',download_id:'job',download_client:'hub',release:'Crash Bandicoot 2'});
  await $('#q-clearfail').onclick();
  assert.match($('#page').innerHTML,/metadata HTTP 503/);
  assert.match($('#page').children[0].textContent,/B: disk full.*C: repair identity/);
+ item.state='import-review';item.import_preview={items:[{primary:'Crash 2.chd'}]};
+ await RENDER.queue();
+ assert.match($('#page').innerHTML,/Preview import/);
+ item.state='imported';
+ await RENDER.queue();
+ assert.doesNotMatch($('#page').innerHTML,/Preview import/);
 })().catch(e=>{console.error(e);process.exitCode=1});
 '''.replace('QUEUE', source.strip().rstrip(';'))
     subprocess.run([node, "-e", script], check=True, capture_output=True, text=True)
