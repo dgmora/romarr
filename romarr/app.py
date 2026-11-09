@@ -1957,6 +1957,12 @@ class ROMarr:
         like one the scorer picked, or Activity and Wanted start disagreeing
         with each other depending on how a game was requested.
         """
+        platform = resolve(platform_slug) if isinstance(platform_slug, str) else None
+        if platform is None:
+            return {"ok": False,
+                    "error": "Select a valid platform and search again before grabbing. "
+                             "A download without a platform cannot be imported."}
+        platform_slug = platform.slug
         refusal = collection_content_refusal(pick)
         if refusal:
             return {"ok": False, "error": refusal}
@@ -6849,8 +6855,12 @@ def make_handler(service: ROMarr):
             self.send_response(code)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                # Navigation can cancel an in-flight fetch before its reply.
+                self.close_connection = True
 
         def _json(self, code: int, payload):
             self._send(code, json.dumps(payload).encode(), "application/json")
