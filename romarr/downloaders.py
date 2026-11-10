@@ -3373,8 +3373,10 @@ class HubDownloader:
             existing = next((r for r in rows if r.get("url") == url
                              and r.get("state") in ("pending", "done")), None)
             if existing is None:
-                existing = {"id": secrets.token_hex(16), "url": url, "name": name,
-                            "save_path": save_path or self._config.save_path,
+                identity = secrets.token_hex(16)
+                target = Path(save_path or self._config.save_path) / f"{_safe_stem(name) or 'hub'}--{identity}"
+                existing = {"id": identity, "url": url, "name": name,
+                            "save_path": str(target),
                             "state": "pending", "detail": "", "file": "",
                             "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
                 rows.append(existing)
@@ -3529,13 +3531,9 @@ class HubDownloader:
             row.update(state="failed",
                        detail=str(outcome.get("error") or "no files fetched"))
             return
-        # A multi-file plan (a disc set) is reported by its directory, which
-        # is what the import sweep already understands from qBittorrent; a
-        # single file is reported by the file itself.
         files = outcome["files"]
         row.update(state="done", detail="",
-                   file=str(Path(files[0]) if len(files) == 1
-                            else Path(files[0]).parent))
+                   file=str(Path(files[0]) if len(files) == 1 else target))
 
 
 def hand_off(client, url: str, *, name: str = "") -> bool:

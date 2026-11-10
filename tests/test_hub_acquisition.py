@@ -86,14 +86,61 @@ def test_the_sweep_fetches_through_the_plugin_and_reports_the_file(tmp_path):
     client.add(hub.encode_result(ROW), name="Super Metroid (USA)")
     done = client.completed()
     assert fetched and fetched[0][0] == ROW
+    target = tmp_path / f"Super Metroid (USA)--{client.last_job_id}"
     assert done == [{"id": client.last_job_id, "name": "Super Metroid (USA)",
-                     "content_path": str(tmp_path / "Super Metroid (USA).sfc"),
-                     "save_path": str(tmp_path),
+                     "content_path": str(target / "Super Metroid (USA).sfc"),
+                     "save_path": str(target),
                      "state": "done"}]
     # The ledger row moved to done and survives a restart.
     rows = json.loads((tmp_path / HubDownloader.LEDGER)
                       .read_text(encoding="utf-8"))
     assert rows[0]["state"] == "done"
+
+
+def test_multi_file_jobs_have_separate_import_paths(tmp_path):
+    def fetch(row, dest):
+        dest = Path(dest)
+        dest.mkdir(parents=True, exist_ok=True)
+        files = [dest / "Game.m3u", dest / "Game.chd"]
+        files[0].write_text("Game.chd\n")
+        files[1].write_bytes(b"game")
+        return {"ok": True, "files": [str(path) for path in files]}
+
+    client = HubDownloader(HubConfig(save_path=str(tmp_path)), fetch=fetch)
+    first = hub.encode_result(dict(ROW, source_id="one"))
+    second = hub.encode_result(dict(ROW, source_id="two"))
+    assert client.add(first, name="Same/Game")
+    first_id = client.last_job_id
+    assert client.add(second, name="Same/Game")
+    second_id = client.last_job_id
+    assert first_id != second_id
+    client.completed()
+    client.completed()
+    completed = client.completed()
+    assert len(completed) == 2
+    assert {row["content_path"] for row in completed} == {
+        str(tmp_path / f"Game--{identity}") for identity in (first_id, second_id)}
+    assert all({p.name for p in Path(row["content_path"]).iterdir()} ==
+               {"Game.m3u", "Game.chd"} for row in completed)
+    from romarr.import_intent import preview_import
+    from romarr.platforms import resolve
+    for row in completed:
+        preview = preview_import(Path(row["content_path"]), resolve("psx"),
+                                 tmp_path / "library")
+        assert not preview["requires_review"]
+        assert len(preview["items"]) == 1
+        assert set(preview["items"][0]["members"]) == {"Game.m3u", "Game.chd"}
+
+
+def test_completed_legacy_hub_job_keeps_its_path(tmp_path):
+    old = tmp_path / "old-game.chd"
+    old.write_bytes(b"old")
+    (tmp_path / HubDownloader.LEDGER).write_text(json.dumps([{
+        "url": hub.encode_result(ROW), "name": "Old Game", "state": "done",
+        "file": str(old), "save_path": str(tmp_path)}]))
+    completed = HubDownloader(HubConfig(save_path=str(tmp_path))).completed()
+    assert completed[0]["content_path"] == str(old)
+    assert completed[0]["save_path"] == str(tmp_path)
 
 
 def test_a_failed_fetch_is_recorded_with_its_reason(tmp_path):
