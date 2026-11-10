@@ -7563,6 +7563,7 @@ def make_handler(service: ROMarr):
                 return self._json(200, {"available": hub.available(),
                                         "sandboxed": confined,
                                         "sandbox_detail": why,
+                                        "archive_org_auth": hub.archive_org_auth_status(),
                                         "searchable_plugins": searchable,
                                         # The Plugins page says out loud what
                                         # enabling a plugin now does: its
@@ -8231,6 +8232,11 @@ def make_handler(service: ROMarr):
                     "ok": got.ok, "url": got.url, "host": got.host,
                     "reason": got.reason,
                 })
+            if route.path == "/api/v1/hub/archive-org/auth":
+                result = hub.archive_org_auth_configure(
+                    email=body.get("email", ""), password=body.get("password", ""),
+                    clear=body.get("clear", False))
+                return self._json(200 if result.get("ok") else 400, result)
             if route.path == "/api/v1/hub/plugin":
                 slug = (body.get("slug") or "").strip()
                 action = (body.get("action") or "").strip()

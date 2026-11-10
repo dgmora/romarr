@@ -164,6 +164,7 @@ DESCRIPTIONS: dict[str, tuple[str, str]] = {
     "/api/v1/hub/igir": ("GET", "Igir v5.8.0 1G1R front-end status, default profile, and CLI execution (POST runs or previews an Igir 1G1R job with {romm} output tokens)."),
     "/api/v1/hub/fleet": ("GET", "Multi-device and network library sync profiles for ES-DE, RetroPie/ArcadePunks, Batocera, Argosy, Grout, Steam Deck, and RetroArch WebDAV (POST builds a 1G1R + gamelist.xml sync plan)."),
     "/api/v1/mcp": ("GET", "Model Context Protocol (MCP) tool manifest and Open-Eyes desktop bridge configuration for ROMarr."),
+    "/api/v1/hub/archive-org/auth": ("POST", "Save or clear host-managed Archive.org credentials; returns status without credentials."),
     "/api/v1/hub/plugin": ("POST", "Install, enable, disable or uninstall a plugin."),
     "/api/v1/hub/source/check": ("POST", "Whether a repository URL may be "
                                          "installed from."),

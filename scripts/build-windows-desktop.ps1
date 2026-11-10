@@ -46,8 +46,8 @@ foreach ($directory in @($backend, $site, $backendApp)) {
 $pythonVersion = '3.13.17'
 $pythonUrl = "https://www.python.org/ftp/python/$pythonVersion/python-$pythonVersion-embed-amd64.zip"
 $pythonSha = '9e35319bffedab8b36ad44d8f377cb4f1733bcec257a0b6d04d94f01486ddb38'
-$hubCommit = '8e46348783546ee03b00e2c933155ba60d29619d'
-$hubUrl = "https://github.com/BlizzHacker/rom-hub/archive/$hubCommit.tar.gz"
+$hubCommit = '2c66cd22d24a8ec4861a74d7b47f23eab2a8d7ca'
+$hubUrl = "https://github.com/dgmora/rom-hub/archive/$hubCommit.tar.gz"
 $gitVersion = '2.56.0.3'
 $gitUrl = 'https://github.com/git-for-windows/git/releases/download/v2.56.0.windows.3/MinGit-2.56.0.3-64-bit.zip'
 $gitSha = '2e5619966e588fde5f8122c5557cad50c0fbafcaed736689f40ec1dfb1d78ea7'
@@ -110,7 +110,7 @@ Copy-Item -LiteralPath (Join-Path $repo 'romarr') -Destination (Join-Path $backe
 $pythonPaths = @('python313.zip', '.', 'Lib/site-packages', 'app', 'import site')
 [IO.File]::WriteAllLines((Join-Path $backend 'python313._pth'), $pythonPaths)
 $packagedPython = Join-Path $backend 'python.exe'
-& $packagedPython -c 'import sys, requests, romarr.app, rom_hub; from rom_hub.cli import main; assert sys.version_info[:3] == (3,13,17); print("Bundled Python, ROMarr and ROM Hub imports passed")'
+& $packagedPython -c 'import sys, requests, romarr.app, rom_hub; from rom_hub.cli import main; from rom_hub.ia_session import archive_transport; assert sys.version_info[:3] == (3,13,17); print("Bundled Python, ROMarr and ROM Hub imports passed")'
 if ($LASTEXITCODE -ne 0) { throw 'The embedded Python package is incomplete.' }
 & (Join-Path $bundle 'git\cmd\git.exe') --version
 if ($LASTEXITCODE -ne 0) { throw 'Bundled MinGit did not run.' }
