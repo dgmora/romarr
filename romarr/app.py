@@ -31,7 +31,9 @@ Routes:
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+from copy import copy, deepcopy
 
 import json
 import logging
@@ -1787,37 +1789,40 @@ class ROMarr:
         wider net: score() already rejects a release naming a foreign system,
         one in the wrong category, or one too large to be a cartridge.
         """
-        seen: set[tuple[str, str]] = set()
-        merged = []
-        # Prowlarr plus every directly-configured indexer. One source failing
-        # must never lose another's results -- an indexer that is down, rate
-        # limited or mid-login is the normal case across a dozen trackers, not
-        # an outage worth abandoning the search for.
-        sources: list[tuple[str, object]] = [("prowlarr", self.prowlarr)]
+        sources = [("prowlarr", self.prowlarr)]
         sources += [(getattr(i, "name", "indexer"), i)
                     for i in getattr(self, "indexers", [])]
-        for term in (game, f"{game} {platform.name}"):
-            for label, source in sources:
+
+        def search_term(term):
+            releases = []
+            with ExitStack() as sessions:
+                for label, source in sources:
+                    try:
+                        if getattr(source, "_owns_session", False):
+                            source = copy(source)
+                            source._session = sessions.enter_context(requests.Session())
+                        releases.extend(source.search(term))
+                    except Exception as err:
+                        log.warning("%s search failed for %r: %s", label, term, err)
+            return releases
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            searches = [pool.submit(search_term, game),
+                        pool.submit(search_term, f"{game} {platform.name}"),
+                        pool.submit(self._hub_releases, game, platform)]
+            seen = set()
+            merged = []
+            for search in searches:
                 try:
-                    found = source.search(term)
+                    releases = search.result()
                 except Exception as err:
-                    log.warning("%s search failed for %r: %s", label, term, err)
+                    log.warning("search task failed: %s", err)
                     continue
-                for release in found:
+                for release in releases:
                     key = (release.title, release.download_url)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    merged.append(release)
-        # Enabled ROM Hub plugins are searched alongside the indexers: the
-        # same titles, scored by the same rules, grabbable from the same
-        # Interactive Search page. One query, not per-term: the Hub's own
-        # fan-out already merges every plugin's answer for it.
-        for release in self._hub_releases(game, platform):
-            key = (release.title, release.download_url)
-            if key not in seen:
-                seen.add(key)
-                merged.append(release)
+                    if key not in seen:
+                        seen.add(key)
+                        merged.append(release)
         return merged
 
     def request(self, game: str, platform_name: str, external_request_id: str = "") -> dict:
