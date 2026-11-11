@@ -617,7 +617,6 @@ class Transmission:
         self.last_job_id = identity
         return True
 
-
     def torrents(self) -> list[dict]:
         body = self._call("torrent-get", {"fields": ["hashString", "name", "downloadDir",
                           "labels", "status", "totalSize", "pieceSize", "percentDone"]})
@@ -694,31 +693,53 @@ class Transmission:
         return self._call("torrent-set", args).get("result") == "success"
 
     def completed(self) -> list[dict]:
+        if not self.configured:
+            return []
         body = self._call("torrent-get", {"fields": [
-            "name", "hashString", "downloadDir", "labels",
-            "leftUntilDone", "percentDone", "totalSize",
+            "name", "hashString", "downloadDir", "percentDone",
+            "metadataPercentComplete", "files", "labels",
+            "leftUntilDone", "totalSize",
         ]})
         if body.get("result") != "success":
             raise RuntimeError("Transmission could not list completed downloads")
-        out = []
-        for torrent in body.get("arguments", {}).get("torrents", []):
-            if self._config.category and self._config.category not in torrent.get("labels", []):
-                continue
-            if (torrent.get("leftUntilDone", 1) != 0
-                    or torrent.get("percentDone", 0) < 1
+
+        category = self._config.category
+        completed = []
+        for torrent in (body.get("arguments") or {}).get("torrents") or []:
+            if (torrent.get("percentDone") != 1 or torrent.get("metadataPercentComplete", 0) != 1
+                    or torrent.get("leftUntilDone", 1) != 0
                     or torrent.get("totalSize", 0) <= 0):
                 continue
-            directory = str(torrent.get("downloadDir") or "").rstrip("/")
-            if self._config.save_path and directory != self._config.save_path.rstrip("/"):
+            labels = torrent.get("labels") or []
+            if category and category not in labels:
                 continue
-            name = str(torrent.get("name") or "")
-            if directory and name:
-                out.append({"name": name, "hash": torrent.get("hashString", ""),
-                            "id": str(torrent.get("hashString") or "").lower(),
-                            "content_path": directory + "/" + name,
-                            "save_path": directory, "category": self._config.category})
-        return out
-
+            directory = torrent.get("downloadDir")
+            if (not directory or (self._config.save_path
+                    and directory.rstrip("/\\") != self._config.save_path.rstrip("/\\"))):
+                continue
+            files = [str(entry.get("name") or "").replace("\\", "/").split("/")
+                     for entry in torrent.get("files") or []]
+            if not files or any(part in ("", ".", "..") or ":" in part or chr(0) in part
+                                for path in files for part in path):
+                continue
+            if len(files) == 1:
+                relative = "/".join(files[0])
+            else:
+                root = files[0][0]
+                if not all(len(path) > 1 and path[0] == root for path in files):
+                    # Never point the importer at a shared downloads folder.
+                    continue
+                relative = root
+            info_hash = str(torrent.get("hashString") or "").lower()
+            if not info_hash:
+                continue
+            completed.append({
+                "id": info_hash, "hash": info_hash, "name": torrent.get("name") or "",
+                "save_path": directory,
+                "content_path": directory.rstrip("/\\") + "/" + relative,
+                "category": category if category in labels else "",
+            })
+        return completed
 
 class Vuze(Transmission):
     """Vuze, which is Transmission's RPC wearing a different badge.

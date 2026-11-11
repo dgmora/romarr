@@ -169,3 +169,26 @@ def test_an_import_mark_survives_a_restart(tmp_path):
     service.store.save()
 
     assert ROMarr({"ROMARR_DATA": str(data)}).queue[0].state == "imported"
+
+
+def test_durable_provider_edits_preserve_acquisition_and_import_state(tmp_path):
+    from dataclasses import asdict
+
+    path = tmp_path / 'state.json'
+    store = Store(path)
+    item = QueueItem('Game', 'snes', 'Release', 1, 'grabbed',
+                     download_id='a' * 40, download_client='transmission',
+                     selected_file={'index': 0, 'name': 'Game.sfc'},
+                     retained_torrent_hash='a' * 40,
+                     import_preview={'token': 'review'},
+                     import_intent={'routes': {'Game.sfc': 'Game.sfc'}},
+                     download_protocol='hub', hub_acceptance='accepted')
+    store.enqueue(item)
+    store.update_settings({'acquisition_only': True})
+    provider = store.put_item('metadata_providers', {'type': 'rawg', 'name': 'RAWG'},
+                              require_persist=True)
+    reopened = Store(path)
+    assert asdict(reopened.queue[0]) == asdict(item)
+    assert reopened.settings['acquisition_only'] is True
+    assert reopened.delete_item('metadata_providers', provider['id'], require_persist=True)
+    assert asdict(Store(path).queue[0]) == asdict(item)

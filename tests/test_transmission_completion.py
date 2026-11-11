@@ -8,7 +8,7 @@ def client():
     return Transmission(TransmissionConfig(base_url="http://localhost:9091", category="romarr", save_path="/downloads/romarr"))
 
 def torrent(**changes):
-    return {"hashString": HASH, "name": "Demo.sfc", "labels": ["romarr"], "downloadDir": "/downloads/romarr", "leftUntilDone": 0, "percentDone": 1, "totalSize": 100, **changes}
+    return {"hashString": HASH, "name": "Demo.sfc", "labels": ["romarr"], "downloadDir": "/downloads/romarr", "leftUntilDone": 0, "percentDone": 1, "totalSize": 100, "metadataPercentComplete": 1, "files": [{"name": "Demo.sfc"}], **changes}
 
 def test_configured_directory_and_identity():
     c = client()
@@ -99,3 +99,39 @@ def test_invalid_saved_native_priority_does_not_send_request():
     with pytest.raises(ValueError, match="invalid saved"):
         c.set_file_priorities(HASH, {0: 1}, native_priorities={0: 9})
     c._call.assert_not_called()
+
+
+@pytest.mark.parametrize('files,relative', [
+    ([{'name': 'Actual.sfc'}], 'Actual.sfc'),
+    ([{'name': 'Set/A.cue'}, {'name': 'Set/A.bin'}], 'Set'),
+    ([{'name': r'Set\A.cue'}, {'name': r'Set\A.bin'}], 'Set'),
+])
+def test_completion_uses_actual_files(files, relative):
+    c = client()
+    c._call = Mock(return_value={'result': 'success', 'arguments': {'torrents': [
+        torrent(name='Display title', files=files)]}})
+    row, = c.completed()
+    assert row['content_path'] == '/downloads/romarr/' + relative
+    assert row['name'] == 'Display title'
+
+
+@pytest.mark.parametrize('files', [
+    [], [{'name': ''}], [{'name': '../Game.sfc'}], [{'name': '/Game.sfc'}],
+    [{'name': r'C:\Game.sfc'}], [{'name': 'Set/./Game.sfc'}],
+    [{'name': 'Set//Game.sfc'}], [{'name': 'Set/Game\x00.sfc'}],
+    [{'name': 'A.cue'}, {'name': 'A.bin'}],
+    [{'name': 'A/Game.sfc'}, {'name': 'B/Game.sfc'}],
+])
+def test_completion_rejects_unsafe_payload_paths(files):
+    c = client()
+    c._call = Mock(return_value={'result': 'success', 'arguments': {'torrents': [torrent(files=files)]}})
+    assert c.completed() == []
+
+
+@pytest.mark.parametrize('changes', [
+    {'metadataPercentComplete': 0}, {'metadataPercentComplete': None}, {'hashString': ''},
+])
+def test_completion_requires_metadata_and_identity(changes):
+    c = client()
+    c._call = Mock(return_value={'result': 'success', 'arguments': {'torrents': [torrent(**changes)]}})
+    assert c.completed() == []
