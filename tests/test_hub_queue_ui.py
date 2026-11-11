@@ -14,7 +14,7 @@ def test_queue_shows_hub_failure_and_bulk_refusals_after_refresh():
     script = r'''
 const assert=require('node:assert/strict');
 const item={game:'Crash 2',platform:'psx',release:'Crash Bandicoot 2',state:'failed',
- detail:'metadata HTTP 503',hub:true,at:'now',download_id:'job',download_client:'hub'};
+ display_release:'Crash — Discs 1, 3',detail:'metadata HTTP 503',hub:true,at:'now',download_id:'job',download_client:'hub'};
 const nodes={};
 const $=key=>nodes[key]??=(key==='#page'?{
  html:'',children:[],set innerHTML(v){this.html=v;this.children=[]},
@@ -36,6 +36,7 @@ RENDER.queue=QUEUE;
 (async()=>{
  await RENDER.queue();
  assert.match($('#page').innerHTML,/metadata HTTP 503/);
+ assert.match($('#page').innerHTML,/Crash — Discs 1, 3/);
  assert.match($('#page').innerHTML,/Retry/);
  assert.doesNotMatch($('#page').innerHTML,/Preview import/);
  await retry.onclick();

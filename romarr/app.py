@@ -2084,6 +2084,7 @@ class ROMarr:
                          external_request_id=external_request_id,
                          download_id=download_id,
                          download_client=getattr(client, "romarr_id", ""),
+                         display_release=release_title,
                          manual=manual,
                          file_selection_required=required_file,
                          selected_file=(getattr(client, "last_selected_file", {})
@@ -2301,6 +2302,23 @@ class ROMarr:
         return (item.indexer.startswith("hub:") or any(
             isinstance(c, HubDownloader) and getattr(c, "romarr_id", "")
             and c.romarr_id == item.download_client for c in self.clients))
+
+    def queue_display_release(self, item):
+        if item.display_release or not self._is_hub_row(item):
+            return item.display_release or item.release
+        try:
+            job = self._hub_client_for(item).job_for(item)
+            result = hub.decode_result(job["url"])
+            if result.get("disc_set"):
+                from .disc_groups import identity
+                numbers = sorted(identity(member)[1] for member in result["disc_set"])
+                base = Path(result["disc_title"])
+                platform = resolve(item.platform)
+                title = base.stem if base.suffix.lower() in platform.extensions else str(base)
+                return f"{title} — Discs {', '.join(map(str, numbers))}"
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            pass
+        return item.release
 
     def _hub_client_for(self, item):
         matches = [c for c in self.clients if isinstance(c, HubDownloader)
@@ -7327,7 +7345,8 @@ def make_handler(service: ROMarr):
             if route.path == "/api/v1/queue/import-plan":
                 return self._json(200, service.queue_import_plan(int((query.get("index") or ["-1"])[0]), {}))
             if route.path == "/api/v1/queue":
-                return self._json(200, {"items": [{**asdict(i), "hub": service._is_hub_row(i)} for i in service.queue]})
+                return self._json(200, {"items": [{**asdict(i), "display_release": service.queue_display_release(i),
+                                                    "hub": service._is_hub_row(i)} for i in service.queue]})
             if route.path == "/api/v1/history":
                 limit = int((query.get("limit") or ["100"])[0])
                 return self._json(200, {"items": service.store.history(limit)})

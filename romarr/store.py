@@ -156,6 +156,7 @@ class QueueItem:
     download_protocol: str = ""
     hub_acceptance: str = ""
     hub_failure_recorded: bool = False
+    display_release: str = ""
 
 
 @dataclass

@@ -76,6 +76,12 @@ def test_candidate_and_persisted_job(tmp_path, monkeypatch):
     grabbed = service.grab_candidate(candidate['id'], 'dc')
     assert grabbed['ok']
     assert grabbed['release'] == 'Shenmue (USA) — Discs 1, 3'
+    assert service.queue[-1].display_release == grabbed['release']
+    assert client.job_for(service.queue[-1])['name'] == service.queue[-1].release
+    item = service.queue[-1]
+    item.display_release = ''
+    client.romarr_id = item.download_client = 'hub-client'
+    assert service.queue_display_release(item) == grabbed['release']
     monkeypatch.setattr(hub, '_fetch_one', download)
     restarted = HubDownloader(HubConfig(save_path=str(tmp_path / 'hub')))
     completed = restarted.completed()

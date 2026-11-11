@@ -3339,7 +3339,7 @@ RENDER.queue=async()=>{
     </div>`+(d.items.length?`<table><thead><tr><th>Game</th>
     <th>Platform</th><th>Release</th><th>Seeders</th><th>State</th><th></th></tr></thead><tbody>
     ${d.items.map((i,n)=>`<tr><td>${esc(i.game)}</td><td>${esc(i.platform)}</td>
-      <td>${esc(i.release||'—')}</td><td>${i.seeders||'—'}</td>
+      <td>${esc(i.display_release||i.release||'—')}</td><td>${i.seeders||'—'}</td>
       <td><span class="pill ${esc(i.state)}">${esc(i.state==='failed'?'Failed':i.state)}</span>
       ${i.detail?`<div style="color:var(--dim);font-size:11.5px">${esc(i.detail)}</div>`:''}
       </td><td style="text-align:right"><div class="rowact">
