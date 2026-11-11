@@ -93,6 +93,7 @@ def test_transmission_answers_the_409_session_challenge():
 
     session = FakeSession([
         FakeResponse(409, {}, {"X-Transmission-Session-Id": "abc123"}),
+        FakeResponse(200, {"result": "success", "arguments": {"rpc-version": 17}}),
         FakeResponse(200, {"result": "success",
                            "arguments": {"torrent-added": {"id": 1, "hashString": "a" * 40}}}),
     ])
@@ -100,7 +101,7 @@ def test_transmission_answers_the_409_session_challenge():
                           session=session)
 
     assert client.add("magnet:?xt=urn:btih:abc")
-    assert len(session.calls) == 2, "it must retry, not give up"
+    assert len(session.calls) == 3, "it must retry discovery, then submit"
     assert session.calls[1]["headers"]["X-Transmission-Session-Id"] == "abc123"
 
 
@@ -110,24 +111,25 @@ def test_transmission_reuses_the_session_id_it_was_given():
 
     session = FakeSession([
         FakeResponse(409, {}, {"X-Transmission-Session-Id": "abc"}),
-        FakeResponse(200, {"result": "success"}),
+        FakeResponse(200, {"result": "success", "arguments": {"rpc-version": 17}}),
         FakeResponse(200, {"result": "success"}),
     ])
     client = Transmission(TransmissionConfig(base_url="http://t:9091"),
                           session=session)
     client.add("magnet:?xt=urn:btih:a")
     client.add("magnet:?xt=urn:btih:b")
-    assert len(session.calls) == 3, "only the first call should be challenged"
+    assert len(session.calls) == 4, "only the first call should be challenged"
 
 
 def test_transmission_posts_to_the_rpc_path():
     from romarr.downloaders import Transmission, TransmissionConfig
 
-    session = FakeSession([FakeResponse(200, {"result": "success"})])
+    session = FakeSession([FakeResponse(body={"result": "success", "arguments": {"rpc-version": 17}}),
+                           FakeResponse(body={"result": "success"})])
     Transmission(TransmissionConfig(base_url="http://t:9091"),
                  session=session).add("magnet:?xt=urn:btih:a")
     assert session.calls[0]["url"].endswith("/transmission/rpc")
-    body = json.loads(session.calls[0]["data"])
+    body = json.loads(session.calls[1]["data"])
     assert body["method"] == "torrent-add"
     assert body["arguments"]["filename"] == "magnet:?xt=urn:btih:a"
 
@@ -137,7 +139,8 @@ def test_transmission_reports_a_non_success_result_as_failure():
     only the status code calls every rejection a success."""
     from romarr.downloaders import Transmission, TransmissionConfig
 
-    session = FakeSession([FakeResponse(200, {"result": "invalid or corrupt"})])
+    session = FakeSession([FakeResponse(body={"result": "success", "arguments": {"rpc-version": 17}}),
+                           FakeResponse(200, {"result": "invalid or corrupt"})])
     assert not Transmission(TransmissionConfig(base_url="http://t:9091"),
                             session=session).add("magnet:?xt=urn:btih:a")
 
@@ -147,6 +150,7 @@ def test_transmission_accepts_its_own_duplicate():
     from romarr.downloaders import Transmission, TransmissionConfig
 
     session = FakeSession([
+        FakeResponse(body={"result": "success", "arguments": {"rpc-version": 17}}),
         FakeResponse(200, {"result": "success", "arguments": {
             "torrent-duplicate": {"id": 3, "hashString": "a" * 40}}}),
         FakeResponse(200, {"result": "success", "arguments": {"torrents": [{
@@ -266,6 +270,7 @@ def test_transmission_imports_a_completed_job_by_hash_and_mapped_file(tmp_path):
                "labels": ["romarr"], "isFinished": False, "leftUntilDone": 0, "totalSize": 14}
     session = FakeSession([
         FakeResponse(409, {}, {"X-Transmission-Session-Id": "fixture"}),
+        FakeResponse(body={"result": "success", "arguments": {"rpc-version": 17}}),
         FakeResponse(body={"result": "success", "arguments": {
             "torrent-added": {"hashString": info_hash.upper()},
         }}),

@@ -431,6 +431,7 @@ def test_vuze_and_biglybt_speak_transmissions_rpc():
 
 def test_vuze_answers_the_409_challenge_like_transmission_does():
     replies = [Reply({}, status=409, headers={"X-Transmission-Session-Id": "s1"}),
+               Reply({"result": "success", "arguments": {"rpc-version": 17}}),
                Reply({"result": "success", "arguments": {"torrent-added": {"hashString": "a" * 40}}})]
     session = Router(lambda *a: replies.pop(0))
     from romarr.downloaders import TransmissionConfig

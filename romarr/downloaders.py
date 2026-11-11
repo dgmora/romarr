@@ -522,6 +522,8 @@ class Transmission:
         self._session = session or requests.Session()
         self._session_id = ""
         self._added = threading.local()
+        self._rpc_version = None
+        self._rpc_version_lock = threading.Lock()
 
     @property
     def last_job_id(self):
@@ -550,17 +552,31 @@ class Transmission:
             if getattr(response, "status_code", 200) == 409 and attempt == 0:
                 self._session_id = response.headers.get(self.SESSION_HEADER, "")
                 continue
+            response.raise_for_status()
             try:
                 return response.json() or {}
             except Exception:
                 return {}
         return {}
 
+    def _get_rpc_version(self, *, refresh=False) -> int:
+        with self._rpc_version_lock:
+            if refresh or self._rpc_version is None:
+                body = self._call("session-get", {})
+                version = (body.get("arguments") or {}).get("rpc-version")
+                if body.get("result") != "success" or type(version) is not int or version < 1:
+                    raise RuntimeError("could not discover Transmission RPC version")
+                self._rpc_version = version
+            return self._rpc_version
+
     def reachable(self) -> bool:
+        if not self.configured:
+            return False
         try:
-            return bool(self._call("session-get", {}))
+            self._get_rpc_version(refresh=True)
+            return True
         except Exception as exc:
-            log.warning("Transmission unreachable: %s", exc)
+            log.warning("%s unreachable: %s", self.name, exc)
             return False
 
     def add(self, magnet_or_url: str, *, save_path: str | None = None) -> bool:
@@ -575,17 +591,17 @@ class Transmission:
         destination = save_path or self._config.save_path
         if destination:
             arguments["download-dir"] = destination
-        if self._config.category:
-            arguments["labels"] = [self._config.category]
         try:
+            version = self._get_rpc_version() if self._config.category else None
+            if version is not None:
+                if version < 16:
+                    raise RuntimeError("configured labels require Transmission RPC 16 or later")
+                if version >= 17:
+                    arguments["labels"] = [self._config.category]
             body = self._call("torrent-add", arguments)
         except Exception as exc:
-            log.warning("Transmission add failed: %s", exc)
+            log.warning("%s add failed: %s", self.name, exc)
             return False
-        # Transmission answers HTTP 200 with {"result": "<error text>"} when
-        # it refuses, so reading the status code alone calls every rejection a
-        # success. "torrent-duplicate" in the arguments means it is already
-        # there, which is the outcome the caller wanted.
         if body.get("result") != "success":
             log.warning("Transmission refused the torrent: %s", body.get("result"))
             return False
@@ -595,24 +611,30 @@ class Transmission:
         if not identity:
             log.warning("Transmission did not return a torrent identity")
             return False
-        if added.get("torrent-duplicate"):
-            # torrent-add does not apply labels or move an existing torrent.
-            # Never adopt another application's data or change its ownership.
+        duplicate = bool(added.get("torrent-duplicate"))
+        label_after_add = version == 16 and not duplicate
+        if duplicate or label_after_add:
             try:
+                if label_after_add:
+                    result = self._call("torrent-set", {
+                        "ids": [identity], "labels": [self._config.category]})
+                    if result.get("result") != "success":
+                        raise RuntimeError("could not apply the configured torrent label")
                 existing = self._call("torrent-get", {"ids": [identity],
                     "fields": ["hashString", "labels", "downloadDir"]})
+                rows = (existing.get("arguments") or {}).get("torrents") or []
+                owned = (existing.get("result") == "success" and len(rows) == 1
+                         and str(rows[0].get("hashString") or "").lower() == identity
+                         and bool(self._config.category)
+                         and self._config.category in (rows[0].get("labels") or [])
+                         and bool(rows[0].get("downloadDir"))
+                         and (not duplicate or bool(destination))
+                         and (not destination or str(rows[0]["downloadDir"]).rstrip("/")
+                              == str(destination).rstrip("/")))
+                if not owned:
+                    raise RuntimeError("torrent hash, label or download directory does not match ROMarr")
             except Exception as exc:
-                log.warning("Could not inspect duplicate torrent: %s", exc)
-                return False
-            rows = existing.get("arguments", {}).get("torrents", [])
-            owned = (existing.get("result") == "success" and len(rows) == 1
-                     and str(rows[0].get("hashString") or "").lower() == identity
-                     and bool(self._config.category) and bool(destination)
-                     and self._config.category in rows[0].get("labels", [])
-                     and str(rows[0].get("downloadDir") or "").rstrip("/")
-                         == str(destination).rstrip("/"))
-            if not owned:
-                log.warning("Duplicate torrent is outside ROMarr's label or download directory; refusing adoption")
+                log.warning("%s ownership verification failed; torrent left intact: %s", self.name, exc)
                 return False
         self.last_job_id = identity
         return True

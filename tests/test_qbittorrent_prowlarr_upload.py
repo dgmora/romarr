@@ -255,6 +255,7 @@ def test_transmission_receives_resolved_prowlarr_release(tmp_path, magnet_redire
     service = ROMarr({"ROMARR_DATA": str(tmp_path / "state.json")})
     service.prowlarr = prowlarr(FetchSession([response]))
     client = Transmission(TransmissionConfig("http://transmission:9091", category="romarr", save_path="/downloads/romarr"))
+    client._rpc_version = 17
     client._call = Mock(return_value={"result": "success", "arguments": {"torrent-added": {"hashString": "a" * 40}}})
     service.clients = [client]
     release = Release("Super Metroid (USA).smc", 3_000_000, 20, (1030,),
