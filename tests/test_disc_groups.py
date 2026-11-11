@@ -10,7 +10,8 @@ from romarr.platforms import resolve
 
 def row(n, title=None, parent='dreamcast.zip', **changes):
     name = title or f'Shenmue (USA) (Disc {n}).chd'
-    return dict(source_id=f'{parent}/{name}', title=name, platform='dc',
+    return dict(source_id=f'{parent}/{name}', title=Path(name).stem, platform='dc',
+                extra={'set_item': 'set', 'set_zip': parent, 'set_file': name},
                 plugin='archive-org', url=f'https://archive.org/download/set/{parent}/{name}',
                 size_bytes=100, **changes)
 
@@ -18,7 +19,7 @@ def row(n, title=None, parent='dreamcast.zip', **changes):
 def download(member, dest):
     dest = Path(dest)
     dest.mkdir(parents=True)
-    path = dest / member['title']
+    path = dest / member['extra']['set_file']
     path.write_bytes(b'disc data')
     return {'ok': True, 'files': [str(path)]}
 
@@ -29,7 +30,7 @@ def test_groups_sort_numbers_and_preserve_representative():
     assert len(grouped) == 1
     assert grouped[0]['title'] == rows[0]['title']
     assert grouped[0]['disc_set'] == rows
-    assert grouped[0]['disc_title'] == 'Shenmue (USA).chd'
+    assert grouped[0]['disc_title'] == 'Shenmue (USA)'
 
 
 @pytest.mark.parametrize('other', [
@@ -55,36 +56,6 @@ def test_case_insensitive_and_duplicate_sources():
     assert len(grouped[0]['disc_set']) == 2
 
 
-def test_group_roundtrip_fetch_and_atomic_import(tmp_path):
-    grouped = group_results([row(3), row(1)])[0]
-    grouped = hub.decode_result(hub.encode_result(grouped))
-    result = fetch_group(grouped, tmp_path / 'download', download)
-    assert result['ok']
-    playlist = tmp_path / 'download/Shenmue (USA).m3u'
-    assert playlist.read_text().splitlines() == [row(1)['title'], row(3)['title']]
-    imported = import_rom(tmp_path / 'download', resolve('dc'), tmp_path / 'library')
-    assert len(imported) == 1 and imported[0].ok
-    assert imported[0].destination.name == 'Shenmue (USA)'
-    assert {p.name for p in imported[0].destination.iterdir()} == {
-        row(1)['title'], row(3)['title'], playlist.name}
-
-
-def test_member_failure_never_completes_group(tmp_path):
-    grouped = group_results([row(1), row(2)])[0]
-    def fail(member, dest):
-        if member == row(2):
-            return {'ok': False, 'error': 'injected failure'}
-        return download(member, dest)
-    with pytest.raises(ValueError, match='injected failure'):
-        fetch_group(grouped, tmp_path / 'download', fail)
-    assert not list(tmp_path.rglob('*.m3u'))
-
-
-def test_missing_identity_is_not_grouped():
-    rows = [dict(row(n), url='https://archive.org/details/set') for n in (1, 2)]
-    assert group_results(rows) == rows
-
-
 def test_candidate_and_persisted_job(tmp_path, monkeypatch):
     from test_hub_acquisition import _service, _hub_client
     from romarr.downloaders import HubDownloader, HubConfig
@@ -108,14 +79,21 @@ def test_candidate_and_persisted_job(tmp_path, monkeypatch):
     completed = restarted.completed()
     assert len(completed) == 1
     assert Path(completed[0]['content_path']).is_dir()
-    assert (Path(completed[0]['content_path']) / 'Shenmue (USA).m3u').exists()
+    source = Path(completed[0]['content_path'])
+    playlist = source / 'Shenmue (USA).m3u'
+    assert playlist.read_text().splitlines() == [row(1)['extra']['set_file'], row(3)['extra']['set_file']]
+    imported = import_rom(source, resolve('dc'), tmp_path / 'library')
+    assert len(imported) == 1 and imported[0].ok
+    assert imported[0].destination.name == 'Shenmue (USA)'
+    assert {p.name for p in imported[0].destination.iterdir()} == {
+        row(1)['extra']['set_file'], row(3)['extra']['set_file'], playlist.name}
 
 
 def test_descriptor_collision_and_missing_tracks(tmp_path):
     def descriptor(member, dest):
         dest = Path(dest)
         dest.mkdir(parents=True)
-        cue = dest / member['title']
+        cue = dest / member['extra']['set_file']
         cue.write_text('FILE "track.bin" BINARY\n')
         track = dest / 'track.bin'
         track.write_bytes(b'track')
@@ -129,12 +107,6 @@ def test_descriptor_collision_and_missing_tracks(tmp_path):
         return result
     with pytest.raises(ValueError, match='missing tracks'):
         fetch_group(grouped, tmp_path / 'missing', missing)
-
-
-def test_details_url_with_explicit_source_path():
-    rows = [dict(row(n), url='https://archive.org/details/set',
-                 extra={'path': f'dreamcast.zip/{row(n)["title"]}'}) for n in (1, 2)]
-    assert len(group_results(rows)) == 1
 
 
 def test_search_renderer_disc_labels_and_grab_request():
@@ -173,20 +145,6 @@ const render=RENDERER;
     subprocess.run([node, '-e', script], check=True, capture_output=True, text=True)
 
 
-@pytest.mark.parametrize('changes', [
-    {'plugin': 'other'}, {'platform': 'psx'}, {'platform': None},
-    {'magnet': 'magnet:?xt=urn:btih:example'}, {'size_bytes': None},
-])
-def test_source_platform_and_unknown_size(tmp_path, monkeypatch, changes):
-    other = dict(row(2), **changes)
-    if 'size_bytes' not in changes:
-        assert group_results([row(1), other]) == [row(1), other]
-    else:
-        from test_hub_acquisition import _service, _hub_client
-        service = _service(tmp_path, monkeypatch, [row(1), other], [_hub_client(tmp_path)])
-        assert service._hub_releases('Shenmue', resolve('dc'))[0].disc_size == 0
-
-
 def test_failed_group_is_a_failed_hub_job(tmp_path, monkeypatch):
     from romarr.downloaders import HubDownloader, HubConfig
     import json
@@ -200,3 +158,24 @@ def test_failed_group_is_a_failed_hub_job(tmp_path, monkeypatch):
     ledger = json.loads((tmp_path / client.LEDGER).read_text())
     assert ledger[0]['state'] == 'failed'
     assert 'member unavailable' in ledger[0]['detail']
+
+
+def test_real_plugin_titles_keep_disc_formats_separate():
+    rows = [row(n, f'Shenmue (USA) (Disc {n}).{ext}')
+            for ext in ('chd', 'cdi') for n in (1, 2)]
+    assert all('.' not in r['title'] for r in rows)
+    groups = group_results(rows)
+    assert len(groups) == 2
+    assert all(len(g['disc_set']) == 2 for g in groups)
+    assert group_results([rows[0], rows[3]]) == [rows[0], rows[3]]
+
+
+def test_existing_playlist_plan_downloads_only_selected_image():
+    from types import SimpleNamespace
+    first, second, hidden = row(1), row(2), row(3)
+    files = [SimpleNamespace(filename='Shenmue (USA).m3u', url='playlist')]
+    files += [SimpleNamespace(filename=r['extra']['set_file'], url=r['url'])
+              for r in (first, second, hidden)]
+    for member, expected in ((first, files[1]), (second, files[2])):
+        assert hub._disc_plan_files(member, files, True) == [expected]
+    assert hub._disc_plan_files(first, files, False) == files

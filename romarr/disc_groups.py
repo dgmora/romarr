@@ -36,7 +36,8 @@ def identity(row):
     base = re.sub(r"\s+(\.[^ .]+)$", r"\1", base)
     if not base:
         return None
-    return (platform.slug, parent, base.casefold()), number, base
+    suffix = PurePosixPath(unquote(url.path)).suffix.lower()
+    return (platform.slug, parent, base.casefold(), suffix), number, base
 
 
 def group_results(rows):
@@ -86,7 +87,7 @@ def fetch_group(row, destination, fetch):
         if "disc_set" in member:
             raise ValueError("nested disc selections are invalid")
         isolated = destination / f".disc-{identity(member)[1]}"
-        outcome = fetch(member, isolated)
+        outcome = fetch(dict(member, disc_exact=True), isolated)
         if not outcome.get("ok") or not outcome.get("files"):
             raise ValueError(outcome.get("error") or "disc fetch returned no files")
         paths = [Path(p) for p in outcome["files"]]

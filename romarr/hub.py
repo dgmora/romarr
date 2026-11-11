@@ -641,6 +641,8 @@ def _fetch_one(row: dict, dest_dir) -> dict:
     except Exception as exc:
         return {"ok": False, "error": f"ROM Hub is not installed: {exc}",
                 "files": []}
+    row = dict(row)
+    exact_disc = row.pop("disc_exact", False)
     slug = str(row.get("plugin") or "")
     try:
         result = SearchResult(**row)
@@ -675,7 +677,7 @@ def _fetch_one(row: dict, dest_dir) -> dict:
                                    or []),
                     transport=archive_transport(slug, HOME)) as downloader:
                 files = []
-                for f in plan.files:
+                for f in _disc_plan_files(row, plan.files, exact_disc):
                     saved = downloader.download(f.url,
                                                 dest / f.relative_path(),
                                                 f.size_bytes)
@@ -686,6 +688,15 @@ def _fetch_one(row: dict, dest_dir) -> dict:
     finally:
         fetcher.close()
     return {"ok": True, "error": "", "files": files}
+
+
+def _disc_plan_files(row, files, exact_disc):
+    if exact_disc and any(f.filename.lower().endswith(".m3u") for f in files):
+        selected = [f for f in files if f.url == row.get("url")]
+        if len(selected) != 1 or selected[0].filename.lower().endswith((".m3u", ".cue", ".gdi")):
+            raise ValueError("playlist plan does not identify the selected disc image")
+        return selected
+    return files
 
 
 def _set_enabled(slug: str, on: bool) -> dict:
