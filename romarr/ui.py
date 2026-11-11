@@ -1833,7 +1833,7 @@ RENDER.search=async()=>{
         <th>Seeders</th><th>Indexer</th><th>Why</th><th></th></tr></thead><tbody>
       ${d.items.map((r,i)=>`<tr style="${r.accepted?'':'opacity:.62'}">
         <td><span class="pill ${r.accepted?'imported':'failed'}">${r.score}</span></td>
-        <td>${esc(r.title)}${r.info_url?` <a href="${esc(r.info_url)}" target="_blank"
+        <td>${esc(r.title)}${r.disc_numbers?.length?` — Discs ${r.disc_numbers.join(', ')}`:''}${r.info_url?` <a href="${esc(r.info_url)}" target="_blank"
             rel="noopener noreferrer" title="Open on ${esc(r.indexer||'the indexer')}"
             style="text-decoration:none">&#8599;</a>`:''}
           ${r.torrent_file_path?`<div class="help" title="Only this path is selected from the collection">File: <code>${esc(r.torrent_file_path)}</code></div>`:''}
@@ -1845,7 +1845,7 @@ RENDER.search=async()=>{
         <td style="color:var(--dim)">${esc(r.indexer||'—')}</td>
         <td style="color:var(--dim);font-size:12px">${r.reasons.map(esc).join('<br>')}</td>
         <td><div class="rowact">${r.grabbable
-          ? `<button data-grab="${esc(r.id)}" data-plat="${esc(r.platform||'')}">Grab</button>`
+          ? `<button data-grab="${esc(r.id)}" data-plat="${esc(r.platform||'')}">Grab${r.disc_numbers?.length?` ${r.disc_numbers.length} discs`:''}</button>`
           : `<span style="color:var(--dim);font-size:12px">${esc(r.grab_refusal||'no link')}</span>`}</div></td>
         </tr>`).join('')}</tbody></table>`;
 

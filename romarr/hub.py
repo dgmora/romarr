@@ -612,6 +612,16 @@ def resolve_torrents(rows: list[dict]) -> list[dict]:
 
 
 def fetch(row: dict, dest_dir) -> dict:
+    if "disc_set" in row:
+        from .disc_groups import fetch_group
+        try:
+            return fetch_group(row, dest_dir, fetch)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return {"ok": False, "error": str(exc), "files": []}
+    return _fetch_one(row, dest_dir)
+
+
+def _fetch_one(row: dict, dest_dir) -> dict:
     """Download one search result into `dest_dir` through its plugin.
 
     The plugin is asked for a FetchPlan -- the Hub re-validates the shape and

@@ -323,6 +323,9 @@ class Release:
     torrent_file_path: str = ""
     file_selection_required: bool = False
     content_kind: str = ""
+    disc_numbers: tuple[int, ...] = ()
+    disc_title: str = ""
+    disc_size: int = 0
 
 
 def collection_content_kind(path: str) -> str:
@@ -928,9 +931,7 @@ def pick_rom_set(filenames: list[str], platform: Platform, *,
 
     playable = [f for f in filenames if not _is_extra(f)]
 
-    # A playlist first, and only for a platform that declares it -- an .m3u
-    # beside a SNES rom is somebody else's file.
-    if _PLAYLIST in platform.extensions:
+    if _PLAYLIST in platform.extensions or platform.is_disc:
         playlists = [f for f in playable if f.lower().endswith(_PLAYLIST)]
         if playlists:
             primary = sorted(playlists, key=lambda f: (-_region_rank(f), len(f)))[0]
@@ -968,7 +969,7 @@ def pick_all_rom_sets(filenames: list[str], platform: Platform, *,
 
     playable = [f for f in filenames if not _is_extra(f)]
 
-    if _PLAYLIST in platform.extensions:
+    if _PLAYLIST in platform.extensions or platform.is_disc:
         playlists = [f for f in playable if f.lower().endswith(_PLAYLIST)]
         if playlists:
             sets = []

@@ -1721,6 +1721,8 @@ class ROMarr:
             rows = hub.resolve_torrents(rows)
         except Exception as exc:  # defensive: resolution must never kill a search
             log.warning("hub torrent resolution failed: %s", exc)
+        from .disc_groups import group_results, identity
+        rows = group_results(rows)
         out = []
         for row in rows:
             if not row.get("title"):
@@ -1776,6 +1778,10 @@ class ROMarr:
                 categories=(1000,),
                 download_url=hub.encode_result(row),
                 protocol="hub",
+                disc_numbers=tuple(sorted(identity(m)[1] for m in row.get("disc_set", []))),
+                disc_title=row.get("disc_title", ""),
+                disc_size=(sum(m["size_bytes"] for m in row["disc_set"])
+                           if row.get("disc_set") and all(m.get("size_bytes") for m in row["disc_set"]) else 0),
                 indexer=f"hub:{row.get('plugin') or 'plugin'}",
                 info_url=str(row.get("url") or ""),
             ))
@@ -2170,9 +2176,11 @@ class ROMarr:
             held[rid] = (r, game, plat_slug)
             items.append({
                 "id": rid,
-                "title": r.title,
+                "title": (Path(r.disc_title).stem if Path(r.disc_title).suffix.lower() in inferred.extensions
+                          else r.disc_title) if r.disc_title and inferred else r.title,
+                "disc_numbers": r.disc_numbers,
                 "platform": plat_slug,
-                "size": r.size,
+                "size": r.disc_size if r.disc_numbers else r.size,
                 "seeders": r.seeders,
                 "indexer": r.indexer,
                 "protocol": r.protocol,
