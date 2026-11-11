@@ -73,7 +73,9 @@ def test_candidate_and_persisted_job(tmp_path, monkeypatch):
     assert candidate['size'] == 200
     assert candidate['reasons'] == judge(releases[0], 'Shenmue', resolve('dc'),
         profile=service.profile_for(resolve('dc')), blocklist=service.blocklist).why()
-    assert service.grab_candidate(candidate['id'], 'dc')['ok']
+    grabbed = service.grab_candidate(candidate['id'], 'dc')
+    assert grabbed['ok']
+    assert grabbed['release'] == 'Shenmue (USA) — Discs 1, 3'
     monkeypatch.setattr(hub, '_fetch_one', download)
     restarted = HubDownloader(HubConfig(save_path=str(tmp_path / 'hub')))
     completed = restarted.completed()

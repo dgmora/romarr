@@ -1981,6 +1981,11 @@ class ROMarr:
                     "error": "Select a valid platform and search again before grabbing. "
                              "A download without a platform cannot be imported."}
         platform_slug = platform.slug
+        release_title = pick.title
+        if getattr(pick, "disc_numbers", ()):
+            base = Path(pick.disc_title)
+            title = base.stem if base.suffix.lower() in platform.extensions else pick.disc_title
+            release_title = f"{title} — Discs {', '.join(map(str, pick.disc_numbers))}"
         refusal = collection_content_refusal(pick)
         if refusal:
             return {"ok": False, "error": refusal}
@@ -2108,7 +2113,7 @@ class ROMarr:
                                 profile=self.profile_for(platform_slug)).why()
             except Exception:
                 reasons = ()
-            self.notify(grabbed(pick.title, platform_slug,
+            self.notify(grabbed(release_title, platform_slug,
                                 getattr(pick, "indexer", ""), reasons))
         else:
             self.store.want(game, platform_slug)
@@ -2118,7 +2123,7 @@ class ROMarr:
             if external_request_id:
                 self.store.update_seerr_request(external_request_id,
                                                 error=item.detail, status="failed")
-        result = {"ok": ok, "release": pick.title, "seeders": pick.seeders}
+        result = {"ok": ok, "release": release_title, "seeders": pick.seeders}
         if not ok:
             result["error"] = failure_detail
         return result
