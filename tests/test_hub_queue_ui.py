@@ -31,6 +31,7 @@ const retry={dataset:{qretry:'0'}},remove={dataset:{qremove:'0'}};
 const document={querySelectorAll:s=>s.includes('qretry')?[retry]:[remove],
  createElement:()=>({setAttribute(){}})};
 const esc=s=>String(s),refreshCounts=()=>{},toast=()=>{},go=()=>{};
+const setInterval=()=>0,clearInterval=()=>{};
 const RENDER={};
 RENDER.queue=QUEUE;
 (async()=>{
@@ -45,10 +46,10 @@ RENDER.queue=QUEUE;
  await $('#q-clearfail').onclick();
  assert.match($('#page').innerHTML,/metadata HTTP 503/);
  assert.match($('#page').children[0].textContent,/B: disk full.*C: repair identity/);
- item.state='import-review';item.import_preview={items:[{primary:'Crash 2.chd'}]};
+ item.state='import-review';item.can_preview_import=true;
  await RENDER.queue();
  assert.match($('#page').innerHTML,/Preview import/);
- item.state='imported';
+ item.state='imported';item.can_preview_import=false;
  await RENDER.queue();
  assert.doesNotMatch($('#page').innerHTML,/Preview import/);
 })().catch(e=>{console.error(e);process.exitCode=1});

@@ -409,3 +409,15 @@ def test_hub_import_retry_requires_completed_download(tmp_path, ledger_state):
     assert not s.queue_action(0, "retry", identity(q))["ok"]
     assert s.queue == [q] and q.state == "import-failed"
     assert c._read() == rows
+
+
+def test_queue_probe_leaves_pending_and_unpersisted_hub_jobs_untouched(tmp_path):
+    """Queue reads do not fetch pending jobs or repair failed ledger writes."""
+    s, c = setup(tmp_path, fetch=lambda *a: pytest.fail("queue probe fetched a job"))
+    q = grab(s)
+    ledger = c._ledger_path().read_bytes()
+    c._unsaved[q.download_id] = ({"state": "done", "detail": "saved later"}, "disk full")
+    rows = s.queue_rows()
+    assert rows[0]["hub"] and not rows[0]["can_preview_import"]
+    assert c._ledger_path().read_bytes() == ledger
+    assert q.download_id in c._unsaved

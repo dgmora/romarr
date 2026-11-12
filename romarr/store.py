@@ -278,10 +278,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "region_scores": {},
     "allow_beta": False,
     "allow_rom_hacks": False,
-    # Acquisition & release profiles (global and per-system)
+    # Acquisition & release profiles (global and per-system).
+    # 0 defers max_size_mb to each platform's native medium ceiling (`Platform.max_size`).
     "min_seeders": 1,
     "min_size_mb": 0,
-    "max_size_mb": 8192,
+    "max_size_mb": 0,
     "size_preference": "auto",       # auto | smaller | larger | none
     "size_weight": 0,
     "preferred_terms": [],
@@ -318,7 +319,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "auto_import": True,
     "rescan_after_import": True,
     "reconcile_after_import": True,
-    # The local folder may be an outgoing spool owned by a delivery process.
     "acquisition_only": False,
     "standalone_export": False,
     # Scan every finished download with ClamAV before it is imported (see

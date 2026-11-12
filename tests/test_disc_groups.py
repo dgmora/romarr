@@ -82,6 +82,9 @@ def test_candidate_and_persisted_job(tmp_path, monkeypatch):
     item.display_release = ''
     client.romarr_id = item.download_client = 'hub-client'
     assert service.queue_display_release(item) == grabbed['release']
+    queue_row = service.queue_rows()[0]
+    assert queue_row['display_release'] == grabbed['release']
+    assert queue_row['hub'] and not queue_row['can_preview_import']
     monkeypatch.setattr(hub, '_fetch_one', download)
     restarted = HubDownloader(HubConfig(save_path=str(tmp_path / 'hub')))
     completed = restarted.completed()

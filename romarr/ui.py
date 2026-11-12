@@ -1211,6 +1211,7 @@ function metadataInvalidate(){metadataCachedFilename='';metadataCachedResult=nul
 function go(page){
   // Hashes are untrusted input; inherited Object properties are not renderers.
   if(!Object.prototype.hasOwnProperty.call(RENDER,page)) page='library';
+  if(typeof RENDER!=='undefined'&&RENDER._queueTimer){clearInterval(RENDER._queueTimer);RENDER._queueTimer=null;}
   activePage=page;
   ++pageVersion;
   metadataLookup?.abort();
@@ -3330,10 +3331,15 @@ RENDER.stats=async()=>{
 };
 
 RENDER.queue=async()=>{
+  clearInterval(RENDER._queueTimer); RENDER._queueTimer=null;
+  const ver=typeof pageVersion==='number'?pageVersion:0;
+  const qv=(RENDER._qVer=(RENDER._qVer||0));
   const d=await j('/api/v1/queue');
+  if((typeof activePage!=='undefined'&&activePage!=='queue')||(typeof pageVersion==='number'&&pageVersion!==ver)||(RENDER._qVer||0)!==qv) return;
   const failed=(d.items||[]).filter(i=>i.state==='failed').length;
   $('#page').innerHTML=`<div class="row" style="margin-bottom:12px">
       <button class="btn ghost" id="q-import">Import completed now</button>
+      <button class="btn ghost" id="q-refresh">Refresh</button>
       ${failed?`<button class="btn ghost" id="q-clearfail">Clear ${failed} failed</button>`:''}
       <span class="help" style="margin:0">${(d.items||[]).length} in flight</span>
     </div>`+(d.items.length?`<table><thead><tr><th>Game</th>
@@ -3344,21 +3350,27 @@ RENDER.queue=async()=>{
       ${i.detail?`<div style="color:var(--dim);font-size:11.5px">${esc(i.detail)}</div>`:''}
       </td><td style="text-align:right"><div class="rowact">
         ${['failed','import-failed'].includes(i.state)?`<button data-qretry="${n}">Retry</button>`:''}
-        ${i.state!=='imported'&&i.import_preview?.items?.length?`<button data-qplan="${n}">Preview import</button>`:''}
+        ${i.can_preview_import?`<button data-qplan="${n}">Preview import</button>`:''}
         ${i.selected_file?.hash||i.retained_torrent_hash?`<button data-qresume="${n}">Resume retained torrent</button>`:''}
         <button data-qremove="${n}">Remove</button></div></td></tr>`).join('')}
       </tbody></table>`
     :'<div class="empty">Queue is empty. Requests in flight show up here.</div>');
 
   $('#q-import').onclick=async e=>{
+    clearInterval(RENDER._queueTimer); RENDER._queueTimer=null;
+    RENDER._qVer=(RENDER._qVer||0)+1;
     e.target.disabled=true; e.target.textContent='Importing…';
     const r=await j('/api/v1/command',{method:'POST',
       headers:{'content-type':'application/json'},
       body:JSON.stringify({name:'ImportCompleted'})});
     toast(r.message||'Done'); go('queue'); refreshCounts();
   };
+  const qr=$('#q-refresh');
+  if(qr) qr.onclick=()=>{qr.disabled=true; go('queue');};
   const cf=$('#q-clearfail');
   if(cf) cf.onclick=async()=>{
+    clearInterval(RENDER._queueTimer); RENDER._queueTimer=null;
+    RENDER._qVer=(RENDER._qVer||0)+1;
     const r=await j('/api/v1/queue/clear',{method:'POST',
       headers:{'content-type':'application/json'},
       body:JSON.stringify({state:'failed'})});
@@ -3370,6 +3382,8 @@ RENDER.queue=async()=>{
     }
   };
   const act=async(index,action)=>{
+    clearInterval(RENDER._queueTimer); RENDER._queueTimer=null;
+    RENDER._qVer=(RENDER._qVer||0)+1;
     const r=await j('/api/v1/queue/action',{method:'POST',
       headers:{'content-type':'application/json'},
       body:JSON.stringify({index:Number(index),action,identity:Object.fromEntries(
@@ -3378,9 +3392,15 @@ RENDER.queue=async()=>{
     go('queue'); refreshCounts();
   };
   document.querySelectorAll('[data-qplan]').forEach(b=>b.onclick=async()=>{
+    clearInterval(RENDER._queueTimer); RENDER._queueTimer=null;
+    RENDER._qVer=(RENDER._qVer||0)+1;
+    if(typeof pageVersion==='number') ++pageVersion;
+    const previewVer=typeof pageVersion==='number'?pageVersion:0;
+    const previewQVer=RENDER._qVer;
     const index=Number(b.dataset.qplan);
     const post=body=>j('/api/v1/queue/import-plan',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({index,...body})});
     const data=await j('/api/v1/queue/import-plan?index='+index);
+    if((typeof activePage!=='undefined'&&activePage!=='queue')||(typeof pageVersion==='number'&&pageVersion!==previewVer)||(RENDER._qVer||0)!==previewQVer) return;
     if(data.error){toast(data.error);return;}
     const plan=data.preview;
     const saved=d.items[index].import_intent||{};
@@ -3419,6 +3439,27 @@ RENDER.queue=async()=>{
   document.querySelectorAll('[data-qresume]').forEach(b=>b.onclick=()=>act(b.dataset.qresume,'resume-retained'));
   document.querySelectorAll('[data-qretry]').forEach(b=>b.onclick=()=>act(b.dataset.qretry,'retry'));
   document.querySelectorAll('[data-qremove]').forEach(b=>b.onclick=()=>act(b.dataset.qremove,'remove'));
+  const snap=JSON.stringify(d.items||[]);
+  if(typeof window!=='undefined'&&typeof activePage!=='undefined'&&(d.items||[]).some(i=>!['imported','failed'].includes(i.state))){
+    let polling=false;
+    RENDER._queueTimer=setInterval(async()=>{
+      if(activePage!=='queue'||(typeof pageVersion==='number'&&pageVersion!==ver)||(RENDER._qVer||0)!==qv||!$('#q-import')){
+        clearInterval(RENDER._queueTimer); RENDER._queueTimer=null; return;
+      }
+      if(polling||document.hidden) return;
+      polling=true;
+      try{
+        const next=await j('/api/v1/queue').catch(()=>null);
+        if(!next||!Array.isArray(next.items)) return;
+        if(activePage!=='queue'||(typeof pageVersion==='number'&&pageVersion!==ver)||(RENDER._qVer||0)!==qv||!$('#q-import')) return;
+        if(JSON.stringify(next.items)!==snap){
+          clearInterval(RENDER._queueTimer); RENDER._queueTimer=null;
+          if(typeof refreshCounts==='function') refreshCounts();
+          RENDER.queue();
+        }
+      }finally{polling=false;}
+    },5000);
+  }
 };
 
 RENDER.history=async()=>{
@@ -3650,6 +3691,7 @@ RENDER.media=()=>settingsPage('Media Management',
   +chk('retain_downloads_after_import','Keep completed downloads for seeding after import',SETTINGS.retain_downloads_after_import)
   +chk('overwrite_existing','Overwrite an existing file',SETTINGS.overwrite_existing)
   +chk('rescan_after_import','Tell your library server to rescan after an import',SETTINGS.rescan_after_import)
+  +chk('reconcile_after_import','Reconcile Wanted aliases against verified library files after an import',SETTINGS.reconcile_after_import!==false)
   +chk('clamav_enabled','Scan downloads with ClamAV before importing them',SETTINGS.clamav_enabled)
   +fld('clamav_address','ClamAV address',SETTINGS.clamav_address||'','text',
      'placeholder="tcp://clamav:3310 or /run/clamav/clamd.sock"')
@@ -3707,7 +3749,11 @@ RENDER.profiles=async()=>{
     };
 
     const minSize=getVal('min_size_mb',0);
-    const maxSize=getVal('max_size_mb',platInfo?platInfo.max_size_mb:8192);
+    const rawGlobalMax=(SETTINGS.max_size_mb&&Number(SETTINGS.max_size_mb)!==8192)?Number(SETTINGS.max_size_mb):0;
+    const rawPlatMax=(!isGlobal&&overrides&&overrides.max_size_mb&&Number(overrides.max_size_mb)!==8192)?Number(overrides.max_size_mb):0;
+    const maxSize=isGlobal
+      ?rawGlobalMax
+      :(rawPlatMax||(platInfo?(rawGlobalMax>0?Math.min(platInfo.max_size_mb,rawGlobalMax):platInfo.max_size_mb):rawGlobalMax));
     const minSeeders=getVal('min_seeders',1);
     const sizePref=getVal('size_preference','auto');
     const sizeWeight=getVal('size_weight',0);
@@ -3885,9 +3931,16 @@ RENDER.profiles=async()=>{
       };
     }
 
+    let maxSizeDirty=false;
+    const maxSizeEl=$('#prof-max-size');
+    if(maxSizeEl){
+      maxSizeEl.oninput=()=>{maxSizeDirty=true;};
+    }
+
     $('#prof-save-btn').onclick=async()=>{
       const minSz=Number($('#prof-min-size').value)||0;
-      const maxSz=Number($('#prof-max-size').value)||0;
+      const inputMaxSz=Number($('#prof-max-size').value)||0;
+      const maxSz=(!isGlobal&&!maxSizeDirty&&!rawPlatMax)?0:inputMaxSz;
       const seeders=Number($('#prof-min-seeders').value)||1;
       const sPref=$('#prof-size-pref').value;
       const sWeight=Number($('#prof-size-weight').value)||0;

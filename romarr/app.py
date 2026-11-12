@@ -31,11 +31,12 @@ Routes:
 
 from __future__ import annotations
 
+import inspect
+import json
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from copy import copy, deepcopy
-
-import json
 import logging
 import os
 import pathlib
@@ -63,13 +64,12 @@ from .dat import DatIndex, parse_dat
 from .decompress import run_batch as run_decompress_batch, scan_compressed
 from .titled import TitleDBIndex, build_index as build_titled_index, validate_switch_rom
 from .downloaders import (
-    AmbiguousQueueMatch, CLIENT_TYPES, NZBGet, NzbgetConfig, SABnzbd, SabConfig,
-    Transmission, HubDownloader, build_client,
+    AmbiguousQueueMatch, Transmission, Blackhole, CLIENT_TYPES, DebridClient, HubDownloader, NZBGet, NzbgetConfig, SABnzbd, SabConfig, SiteDownloader, build_client,
     hand_off_with_id, match_queue_item, merge_secrets, pick_client, redact,
 )
 from .indexers import INDEXER_TYPES, build_indexer, merge_indexer_secrets, redact_indexer
 from .indexers import Prowlarr, ProwlarrConfig, ProwlarrDownloadError
-from .library import import_rom, map_remote_path, platform_dir
+from .library import _custom_platform_folder, import_rom, map_remote_path, platform_dir
 from .selective_import import selected_import_path
 from .collections import is_translation
 from .auth import DISABLED as AUTH_DISABLED
@@ -93,7 +93,7 @@ from .metadata import discover as metadata_discover
 from .openapi import spec as openapi_spec
 from .ops import (LogRing, RateLimiter, make_backup, read_backup,
                   render_metrics, to_csv)
-from .platforms import PLATFORMS, resolve
+from .platforms import PLATFORMS, by_slug, resolve, romm_fs_slug
 from .sso import ForwardAuth
 from .totp import Totp
 from .playability import (
@@ -124,6 +124,18 @@ log = logging.getLogger(__name__)
 # how v1.7.0 shipped calling itself 1.6.0 while the Update page offered an
 # upgrade to the build already running. See version.py.
 VERSION = derive_version()
+
+
+def _comparable_version(value: object) -> bool:
+    """Only well-formed, named versions may be ordered against release tags."""
+    text = str(value or "").strip()
+    if text[:1].lower() == "v":
+        text = text[1:]
+    # Local build metadata (+gSHA, +dirty) is not a stable release identity.
+    # Use only the release/pre/post spellings supported by compare_key.
+    return not is_unknown(value) and bool(re.fullmatch(
+        r"\d+(?:\.\d+)*(?:(?:[._-]?(?:dev|alpha|beta|preview|pre|rc|a|b|c)\.?\d*)|(?:[._-]?post\.?\d+))*",
+        text, flags=re.IGNORECASE))
 
 # What ROMarr labels its own downloads with, so its jobs are distinguishable
 # from everything else in a shared client -- the same reason Radarr and Sonarr
@@ -394,7 +406,10 @@ class ProxyResponse(tuple):
 class ROMarr:
     """The service. Holds config, clients, and the in-flight queue."""
 
+    QUEUE_PROBE_TIMEOUT = 5.0
+
     def __init__(self, env: dict[str, str] | None = None):
+        """Initialize the service state, download/library clients, and persistent store."""
         e = env if env is not None else os.environ
         # Kept so reload_libraries can seed from the environment on first run
         # without the caller having to hand it back in.
@@ -455,7 +470,11 @@ class ROMarr:
         # carrying Prowlarr's API key.
         self._candidates: dict[str, dict] = {}
         self._lock = threading.Lock()
+        # A manual check and the daily sweep must never overlap or auto-apply twice.
+        self._update_check_lock = threading.Lock()
         self._collection_lock = threading.RLock()
+        self._probe_lock = threading.Lock()
+        self._inflight_probes: dict[int, tuple[object, threading.Event, dict[str, object]]] = {}
         # Background sweeps overlap, and client I/O happens before the queue row
         # exists. Reserve a game during that gap, then let the queue row take
         # over after the handoff.
@@ -739,6 +758,12 @@ class ROMarr:
         #: peer_id -> (rows, fetched_at). A friend's shelf, so browsing and
         #: filtering it does not bill their server per keystroke.
         self._friend_shelves: dict[str, tuple[list, float]] = {}
+
+        #: (path, archive_is_the_rom, size, mtime_ns, ctime_ns) -> tuple of
+        #: streamed member hash dicts for reconcile_platform (#161).
+        self._reconcile_hash_cache: OrderedDict[
+            tuple[str, bool, int, int, int], tuple[dict, ...]] = OrderedDict()
+        self._reconcile_cache_lock = threading.Lock()
 
         self.logring = LogRing()
         logging.getLogger().addHandler(self.logring.handler())
@@ -1213,13 +1238,16 @@ class ROMarr:
         `roms/` level, matching RomM's Structure A and B."""
         if (cfg or {}).get("type") == "retrobat":
             return "flat"
-        return str((cfg or {}).get("layout")
-                   or self.store.settings.get("library_layout") or "flat")
+        store = getattr(self, "store", None)
+        fallback = store.settings.get("library_layout") if store is not None else "flat"
+        return str((cfg or {}).get("layout") or fallback or "flat")
 
     def platform_folders(self, cfg: dict | None = None) -> dict[str, str]:
         """Per-platform folder name overrides, merging global and library settings."""
         merged: dict[str, str] = {}
-        for source in (self.store.settings.get("platform_folders"),
+        store = getattr(self, "store", None)
+        global_folders = store.settings.get("platform_folders") if store is not None else {}
+        for source in (global_folders,
                        RETROBAT_FOLDERS if (cfg or {}).get("type") == "retrobat" else {},
                        (cfg or {}).get("platform_folders")):
             if isinstance(source, dict):
@@ -1234,6 +1262,29 @@ class ROMarr:
                         if k and v:
                             merged[str(k)] = str(v)
         return merged
+
+    def _rescan_library(self, target_lib, target_cfg: dict | None,
+                        platform_slug: str, *,
+                        platform_folders: dict[str, str] | None = None) -> None:
+        """Trigger a library rescan, forwarding custom `platform_folders` when supported."""
+        rescan = getattr(target_lib, "rescan", None)
+        if not callable(rescan):
+            return
+        folders = (platform_folders if platform_folders is not None
+                   else self.platform_folders(target_cfg))
+        custom = _custom_platform_folder(platform_slug, folders)
+        if custom:
+            try:
+                params = inspect.signature(rescan).parameters
+                accepts_fs_slug = ("fs_slug" in params or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD
+                    for p in params.values()))
+            except (TypeError, ValueError):
+                accepts_fs_slug = False
+            if accepts_fs_slug:
+                rescan(platform_slug, fs_slug=custom)
+                return
+        rescan(platform_slug)
 
     def path_hint(self, root: Path) -> str:
         """Why a library path is missing, and which fix applies.
@@ -1553,6 +1604,71 @@ class ROMarr:
         return {"ok": bool(ok),
                 "message": "Connected" if ok else "Could not connect or authenticate"}
 
+    def _library_folder_warnings(self, backend, cfg: dict,
+                                 root: Path) -> list[str]:
+        """Warn when RomM folder bindings or disk folders diverge from `platform_folders`."""
+        warnings: list[str] = []
+        seen: set[str] = set()
+
+        def _add(msg: str) -> None:
+            if msg not in seen:
+                seen.add(msg)
+                warnings.append(msg)
+
+        folders = self.platform_folders(cfg)
+        known_romm = {p.slug: p for p in PLATFORMS}
+        known_romm.update({romm_fs_slug(p.slug): p for p in PLATFORMS})
+        lister = (getattr(backend, "platform_bindings", None)
+                  or getattr(backend, "platforms", None))
+        if callable(lister):
+            try:
+                rows = lister() or []
+            except Exception as err:
+                log.debug("romm binding check skipped: %s", err)
+                rows = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                raw_slug = str(row.get("slug") or "").strip()
+                fs_slug = str(row.get("fs_slug") or "").strip()
+                if not raw_slug or not fs_slug:
+                    continue
+                label = str(row.get("platform") or raw_slug)
+                plat = known_romm.get(raw_slug.lower())
+                if plat is None and int(row.get("count") or 0) <= 0:
+                    continue
+                if plat is None:
+                    plat = resolve(raw_slug)
+                canon = plat.slug if plat is not None else raw_slug.lower()
+                custom = _custom_platform_folder(canon, folders)
+                default_slug = romm_fs_slug(canon)
+                if custom:
+                    # Only compare populated rows or canonical slug entries so an empty
+                    # sibling platform in RomM (e.g. `nintendo-dsi`) does not falsely
+                    # flag an `nds` custom folder override.
+                    if fs_slug != custom and (raw_slug.lower() in {canon, default_slug}
+                                              or int(row.get("count") or 0) > 0):
+                        _add(f"RomM binds '{label}' ({raw_slug}) to '{fs_slug}', "
+                             f"while ROMarr's platform_folders uses '{custom}'")
+                elif plat is not None and fs_slug not in {default_slug, canon, raw_slug.lower()}:
+                    _add(f"RomM binds '{label}' ({raw_slug}) to '{fs_slug}', "
+                         f"while ROMarr will write to '{default_slug}' without a "
+                         "platform_folders override")
+
+        checked_canon: set[str] = set()
+        for raw_key in folders:
+            plat = resolve(raw_key) or by_slug(str(raw_key).strip().lower())
+            if plat is None or plat.slug in checked_canon:
+                continue
+            checked_canon.add(plat.slug)
+            custom = _custom_platform_folder(plat.slug, folders)
+            default_slug = romm_fs_slug(plat.slug)
+            if custom and custom != default_slug and (root / default_slug).is_dir():
+                _add(f"Default folder '{default_slug}' exists alongside "
+                     f"platform_folders '{custom}' and may cause duplicate "
+                     "platforms in RomM")
+        return warnings
+
     def test_library(self, cfg: dict) -> dict:
         """Try a library configuration without saving it.
 
@@ -1584,6 +1700,19 @@ class ROMarr:
             return {"ok": False, "path_ok": False,
                     "message": f"Connected, but {root} does not exist here. "
                                "Mount it into ROMarr, or correct the path."}
+        if str(cfg.get("type") or "romm").lower() == "romm":
+            try:
+                warnings = self._library_folder_warnings(backend, cfg, root)
+            except Exception as err:
+                log.debug("library folder warning check failed: %s", err)
+                warnings = []
+            if warnings:
+                summary = "; ".join(warnings[:3])
+                if len(warnings) > 3:
+                    summary += f" (+{len(warnings) - 3} more)"
+                return {"ok": True, "path_ok": True,
+                        "message": f"Connected -- Warning: {summary}",
+                        "warnings": warnings}
         return {"ok": True, "path_ok": True, "message": "Connected"}
 
     # -- operations --------------------------------------------------------
@@ -1802,40 +1931,61 @@ class ROMarr:
         wider net: score() already rejects a release naming a foreign system,
         one in the wrong category, or one too large to be a cartridge.
         """
-        sources = [("prowlarr", self.prowlarr)]
+        # Prowlarr plus every directly-configured indexer. One source failing
+        # must never lose another's results -- an indexer that is down, rate
+        # limited or mid-login is the normal case across a dozen trackers, not
+        # an outage worth abandoning the search for.
+        prowlarr = self.prowlarr
+        sources: list[tuple[str, object]] = [("prowlarr", prowlarr)]
         sources += [(getattr(i, "name", "indexer"), i)
                     for i in getattr(self, "indexers", [])]
 
         def search_term(term):
+            """Query all captured indexer sources for one search string."""
             releases = []
             with ExitStack() as sessions:
                 for label, source in sources:
+                    client = source
                     try:
+                        if isinstance(source, Prowlarr) or getattr(source, "_owns_session", False):
+                            client = copy(source)
                         if getattr(source, "_owns_session", False):
-                            source = copy(source)
-                            source._session = sessions.enter_context(requests.Session())
-                        releases.extend(source.search(term))
+                            client._session = sessions.enter_context(requests.Session())
+                        if isinstance(client, Prowlarr) and source is prowlarr:
+                            client._privacy = privacy
+                        releases.extend(client.search(term))
                     except Exception as err:
                         log.warning("%s search failed for %r: %s", label, term, err)
             return releases
 
+        # Enabled ROM Hub plugins are searched alongside the indexers: the
+        # same titles, scored by the same rules, grabbable from the same
+        # Interactive Search page. One query, not per-term: the Hub's own
+        # fan-out already merges every plugin's answer for it.
         with ThreadPoolExecutor(max_workers=3) as pool:
+            hub_search = pool.submit(self._hub_releases, game, platform)
+            privacy = {}
+            if isinstance(prowlarr, Prowlarr):
+                try:
+                    privacy = prowlarr._private_ids()
+                except Exception as err:
+                    log.warning("prowlarr privacy lookup failed: %r", err)
             searches = [pool.submit(search_term, game),
                         pool.submit(search_term, f"{game} {platform.name}"),
-                        pool.submit(self._hub_releases, game, platform)]
-            seen = set()
-            merged = []
-            for search in searches:
-                try:
-                    releases = search.result()
-                except Exception as err:
-                    log.warning("search task failed: %s", err)
-                    continue
-                for release in releases:
-                    key = (release.title, release.download_url)
-                    if key not in seen:
-                        seen.add(key)
-                        merged.append(release)
+                        hub_search]
+        seen: set[tuple[str, str]] = set()
+        merged = []
+        for search in searches:
+            try:
+                releases = search.result()
+            except Exception as err:
+                log.warning("release search task failed: %r", err)
+                continue
+            for release in releases:
+                key = (release.title, release.download_url)
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(release)
         return merged
 
     def request(self, game: str, platform_name: str, external_request_id: str = "") -> dict:
@@ -1951,6 +2101,17 @@ class ROMarr:
                 changed = True
         if changed:
             self.store.save()
+
+    def _retained_owners_readonly(self, items: list[QueueItem] | None = None) -> list[dict]:
+        """Return retained-collection ownership records without mutating or saving store state."""
+        from .retained_collection import owner_records
+        ledger = list(self.store.settings.get("retained_collection_owners", []))
+        known = {r.get("download_id") for r in ledger}
+        queue_items = self.queue if items is None else items
+        return ledger + [
+            record for record in owner_records(queue_items)
+            if record["download_id"] not in known
+        ]
 
     def _retained_owners(self):
         self._remember_collection_owners()
@@ -2219,7 +2380,190 @@ class ROMarr:
             "items": items,
         }
 
+    @staticmethod
+    def _accepts_timeout_arg(fn) -> bool:
+        """Return True when `fn` declares an explicit `timeout` parameter."""
+        try:
+            return "timeout" in inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return False
+
+    def _call_with_timeout(self, client, fn, timeout: float):
+        """Run a completion probe within a wall-clock wait, capping to one in-flight probe per client."""
+        lock = getattr(self, "_probe_lock", None)
+        inflight = getattr(self, "_inflight_probes", None)
+        if lock is None or inflight is None:
+            lock = threading.Lock()
+            inflight = {}
+            self._probe_lock = lock
+            self._inflight_probes = inflight
+        key = id(client)
+        with lock:
+            existing = inflight.get(key)
+            if existing is not None and existing[0] is client:
+                entry = existing
+                spawn = False
+            else:
+                entry = (client, threading.Event(), {})
+                inflight[key] = entry
+                spawn = True
+        if spawn:
+            def _runner():
+                """Execute the client probe and publish its outcome to its single-flight entry."""
+                _, done_ev, box = entry
+                try:
+                    box["value"] = fn()
+                except BaseException as exc:
+                    box["exc"] = exc
+                finally:
+                    with lock:
+                        done_ev.set()
+                        if inflight.get(key) is entry:
+                            inflight.pop(key, None)
+
+            threading.Thread(target=_runner, daemon=True).start()
+        _, done_ev, box = entry
+        if not done_ev.wait(timeout=max(0.01, float(timeout))):
+            raise TimeoutError("client completed() probe timed out")
+        if "exc" in box:
+            raise box["exc"]  # type: ignore[misc]
+        return box["value"]
+
+    def _completed_queue_downloads(self, items, *, ownership=None, timeout: float | None = None):
+        """Yield `(client, completed_rows)` for queue preview checks without fetch or repair writes."""
+        if ownership is None:
+            with self._lock:
+                ownership = self._retained_owners_readonly(list(self.queue))
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        for client in self.clients:
+            if not getattr(client, "configured", True):
+                continue
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            budget_exhausted = remaining is not None and remaining <= 0
+            try:
+                if isinstance(client, QBittorrent):
+                    if budget_exhausted:
+                        continue
+                    raw_timeout = getattr(getattr(client, "_config", None), "timeout", 5) or 5
+                    probe_timeout = min(float(raw_timeout), self.QUEUE_PROBE_TIMEOUT)
+                    if remaining is not None:
+                        probe_timeout = min(probe_timeout, remaining)
+                    bounded = max(0.01, probe_timeout)
+
+                    def _probe_qbit(c=client, pt=bounded):
+                        """Query selective and general qBittorrent completions within `pt`."""
+                        local_deadline = time.monotonic() + pt
+                        selective = c.selective_completed(
+                            items,
+                            ownership=ownership,
+                            update_cache=False,
+                            timeout=pt,
+                        )
+                        if deadline is not None:
+                            left = local_deadline - time.monotonic()
+                            if left <= 0:
+                                return selective
+                            next_timeout = max(0.01, min(pt, left))
+                        else:
+                            next_timeout = pt
+                        try:
+                            return selective + c.completed(repair=False, timeout=next_timeout)
+                        except Exception as exc:
+                            log.warning("%s completed() failed: %s", getattr(c, "name", c), exc)
+                            return selective
+
+                    candidates = (
+                        self._call_with_timeout(client, _probe_qbit, bounded)
+                        if deadline is not None else _probe_qbit()
+                    )
+                elif isinstance(client, DebridClient):
+                    if budget_exhausted:
+                        candidates = client.completed(fetch=False, timeout=0.0)
+                    else:
+                        raw_timeout = getattr(getattr(client, "_config", None), "timeout", 5) or 5
+                        probe_timeout = min(float(raw_timeout), self.QUEUE_PROBE_TIMEOUT)
+                        if remaining is not None:
+                            probe_timeout = min(probe_timeout, remaining)
+                        bounded = max(0.01, probe_timeout)
+                        try:
+                            candidates = (
+                                self._call_with_timeout(
+                                    client,
+                                    lambda c=client, pt=bounded: c.completed(fetch=False, timeout=pt),
+                                    bounded,
+                                )
+                                if deadline is not None
+                                else client.completed(fetch=False, timeout=bounded)
+                            )
+                        except TimeoutError as exc:
+                            log.warning(
+                                "%s completed() timed out; using cached files: %s",
+                                getattr(client, "name", client),
+                                exc,
+                            )
+                            candidates = client.completed(fetch=False, timeout=0.0)
+                elif isinstance(client, (SiteDownloader, HubDownloader)):
+                    candidates = client.completed(fetch=False)
+                elif isinstance(client, Blackhole):
+                    candidates = client.completed()
+                else:
+                    if budget_exhausted:
+                        continue
+                    completed_fn = getattr(client, "completed", None)
+                    if not callable(completed_fn):
+                        continue
+                    raw_timeout = getattr(getattr(client, "_config", None), "timeout", 5) or 5
+                    probe_timeout = min(float(raw_timeout), self.QUEUE_PROBE_TIMEOUT)
+                    if remaining is not None:
+                        probe_timeout = min(probe_timeout, remaining)
+                    bounded = max(0.01, probe_timeout)
+                    probe_call = (
+                        (lambda fn=completed_fn, pt=bounded: fn(timeout=pt))
+                        if self._accepts_timeout_arg(completed_fn)
+                        else completed_fn
+                    )
+                    candidates = (
+                        self._call_with_timeout(client, probe_call, bounded)
+                        if deadline is not None else probe_call()
+                    )
+            except Exception as exc:
+                log.warning("%s completed() failed: %s", getattr(client, "name", client), exc)
+                continue
+            yield client, candidates
+
+    def queue_rows(self) -> list[dict]:
+        """Return queue items annotated with read-only `can_preview_import` flags."""
+        with self._lock:
+            items = list(self.queue)
+            rows = [{**asdict(item), "display_release": self.queue_display_release(item),
+                     "hub": self._is_hub_row(item)} for item in items]
+            ownership = self._retained_owners_readonly(items)
+        pending = [item for item in items if item.state not in ("imported", "failed")]
+        completed = (
+            [(client, download)
+             for client, downloads in self._completed_queue_downloads(
+                 pending, ownership=ownership, timeout=self.QUEUE_PROBE_TIMEOUT)
+             for download in downloads]
+            if pending else []
+        )
+        for item, row in zip(items, rows):
+            try:
+                row["can_preview_import"] = row["state"] not in ("imported", "failed") and any(
+                    match_queue_item(
+                        items,
+                        download,
+                        client_id=str(getattr(client, "romarr_id", "") or getattr(client, "config_id", "") or ""),
+                        client_protocol=str(getattr(client, "protocol", "") or ""),
+                    ) is item
+                    and not download.get("_romarr_selection_error")
+                    for client, download in completed
+                )
+            except AmbiguousQueueMatch:
+                row["can_preview_import"] = False
+        return rows
+
     def queue_import_plan(self, index: int, body: dict) -> dict:
+        """Build or confirm an interactive import plan for one queued release."""
         from .import_intent import preview_import, choose_import, queue_identity
         from .romm_bundle import decorate_preview, route_selection
         from .library import MissingArchiveTool
@@ -2227,26 +2571,35 @@ class ROMarr:
         import zipfile
         import subprocess
         with self._lock:
-            if not 0 <= index < len(self.queue):
+            items = list(self.queue)
+            if not 0 <= index < len(items):
                 return {"error": "no such queue item"}
-            item = self.queue[index]
+            item = items[index]
             if item.state == "imported":
                 return {"error": "this item has already imported"}
+            ownership = self._retained_owners_readonly(items)
         platform = resolve(item.platform)
         target = self.library_for(item.platform) if platform else None
         if target is None:
             return {"error": "configure a platform and library first"}
         torrent = None
         source_client = None
-        for client in self.clients:
-            if not getattr(client, "configured", True):
-                continue
-            candidates = (client.selective_completed([item], ownership=self._retained_owners()) if isinstance(client, QBittorrent) else [])
-            for candidate in candidates + client.completed():
-                if match_queue_item([item], dict(candidate, _romarr_client=client)) is item:
+        for client, candidates in self._completed_queue_downloads(
+                [item], ownership=ownership, timeout=self.QUEUE_PROBE_TIMEOUT):
+            client_id = str(getattr(client, "romarr_id", "") or getattr(client, "config_id", "") or "")
+            client_protocol = str(getattr(client, "protocol", "") or "")
+            for candidate in candidates:
+                try:
+                    match = match_queue_item(items, candidate, client_id=client_id,
+                                             client_protocol=client_protocol)
+                except AmbiguousQueueMatch as exc:
+                    return {"error": str(exc)}
+                if match is item:
                     torrent = candidate
                     source_client = client
                     break
+            if torrent is not None:
+                break
         if torrent is None:
             return {"error": "download is not complete or cannot be found"}
         if torrent.get("_romarr_selection_error"):
@@ -2286,7 +2639,7 @@ class ROMarr:
                     item.import_intent = intent
                     item.state = "grabbed"
                     item.detail = "Import selection saved; source download will be retained"
-                item.import_preview = preview
+                    item.import_preview = preview
                 self.store.save()
             return {"ok": True, "preview": preview}
         except (OSError, ValueError, RuntimeError, TypeError, MissingArchiveTool, RequestException, zipfile.BadZipFile, subprocess.SubprocessError) as exc:
@@ -2776,8 +3129,12 @@ class ROMarr:
         now = datetime.now(timezone.utc)
         dead: list[QueueItem] = []
         with self._lock:
-            for row in self.queue:
-                if self._is_hub_row(row) or row.blocklisted or not row.release_id:
+            rows = list(self.queue)
+        for row in rows:
+            probe_identity = None
+            with self._lock:
+                if (not any(current is row for current in self.queue)
+                        or self._is_hub_row(row) or row.blocklisted or not row.release_id):
                     continue
                 failure = (failures.get((row.download_client, row.download_id))
                            if row.download_client and row.download_id else None)
@@ -2792,13 +3149,30 @@ class ROMarr:
                     continue
                 if row.state == "grabbed" and stall_minutes > 0:
                     age = self._row_age_minutes(row, now)
-                    if (age is not None and age >= stall_minutes
-                            and not self._is_download_active_or_complete(row)):
-                        row.state = "failed"
-                        row.release_fault = True
-                        row.detail = (f"stalled: no import after "
-                                      f"{int(age)} minutes")
-                        dead.append(row)
+                    if age is not None and age >= stall_minutes:
+                        probe_identity = (row.release_id, row.download_client,
+                                          row.download_id, row.at)
+
+            if probe_identity is None:
+                continue
+            # Do not hold the queue lock during network calls. Retire each
+            # inactive row before polling the next client or queue row.
+            if self._is_download_active_or_complete(row):
+                continue
+            with self._lock:
+                if (not any(current is row for current in self.queue)
+                        or row.blocklisted or row.state != "grabbed"):
+                    continue
+                if (row.release_id, row.download_client,
+                        row.download_id, row.at) != probe_identity:
+                    continue
+                age = self._row_age_minutes(row, now)
+                if age is None or age < stall_minutes:
+                    continue
+                row.state = "failed"
+                row.release_fault = True
+                row.detail = f"stalled: no import after {int(age)} minutes"
+                dead.append(row)
 
         blocklisted = 0
         regrabbed = 0
@@ -2873,11 +3247,13 @@ class ROMarr:
         for client in self.clients:
             if not getattr(client, "configured", True):
                 continue
+            client_id = str(getattr(client, "romarr_id", "") or getattr(client, "config_id", "") or "")
+            client_protocol = str(getattr(client, "protocol", "") or "")
             try:
                 completed = getattr(client, "completed", None)
                 if callable(completed):
                     for item in completed():
-                        if match_queue_item([row], dict(item, _romarr_client=client)) is not None:
+                        if match_queue_item([row], item, client_id=client_id, client_protocol=client_protocol) is not None:
                             return True
             except Exception:
                 pass
@@ -2886,7 +3262,7 @@ class ROMarr:
                              or getattr(client, "torrents", None))
                 if callable(active_fn):
                     for item in active_fn():
-                        if match_queue_item([row], dict(item, _romarr_client=client)) is None:
+                        if match_queue_item([row], item, client_id=client_id, client_protocol=client_protocol) is None:
                             continue
                         progress = float(item.get("progress", 0) or 0)
                         if progress >= 1.0:
@@ -2923,12 +3299,13 @@ class ROMarr:
                 except Exception as err:
                     log.warning("could not remove dead download %r from %s: %s",
                                 row.download_id, getattr(client, "name", client), err)
+            client_protocol = str(getattr(client, "protocol", "") or "")
             deleter = getattr(client, "delete_torrent", None)
             torrents_fn = getattr(client, "torrents", None)
             if callable(deleter) and callable(torrents_fn):
                 try:
                     for item in torrents_fn():
-                        if match_queue_item([row], dict(item, _romarr_client=client)) is not None:
+                        if match_queue_item([row], item, client_id=str(client_id), client_protocol=client_protocol) is not None:
                             thash = str(item.get("hash") or "").strip()
                             if thash and deleter(thash):
                                 removed = True
@@ -3103,6 +3480,7 @@ class ROMarr:
                     "reason": "no library configured to import into"}
         target_cfg, target_lib = target
         label = target_cfg.get("name") or getattr(target_lib, "name", "library")
+        target_folders = self.platform_folders(target_cfg)
 
         outcomes = import_rom(source, platform, self.library_root(target_cfg),
                               dats=self.dats,
@@ -3111,7 +3489,7 @@ class ROMarr:
                 prefer_hardlinks=bool(self.store.settings.get("prefer_hardlinks", False)),
                               layout=self.library_layout(target_cfg),
                               translation=is_translation(source.name),
-                              platform_folders=self.platform_folders(target_cfg),
+                              platform_folders=target_folders,
                               export_only=self.store.settings.get("standalone_export", False))
 
         imported, refused = [], []
@@ -3165,7 +3543,8 @@ class ROMarr:
 
         if (imported and not self.store.settings.get("acquisition_only", False)
                 and self.store.settings.get("rescan_after_import", True)):
-            target_lib.rescan(platform.slug)
+            self._rescan_library(target_lib, target_cfg, platform.slug,
+                                 platform_folders=target_folders)
         self.store.save()
 
         result = {
@@ -3255,6 +3634,57 @@ class ROMarr:
     def dat_names(self) -> list[str]:
         return [d.name for d in self.dats.dats if d.name]
 
+    _RECONCILE_CACHE_MAX = 50_000
+
+    def _reconcile_file_hashes(self, path: Path, platform) -> tuple[dict, ...]:
+        """Return streamed DAT hashes for every member of ``path``.
+
+        Caches computed hash dicts by ``(path, archive_is_the_rom, size,
+        mtime_ns, ctime_ns)`` so repeated reconciles skip rehashing unchanged
+        library files while still re-evaluating ``self.dats`` on DAT reloads.
+        """
+        from .library import _source_for
+
+        st = path.stat()
+        archive_as_rom = bool(getattr(platform, "archive_is_the_rom", False))
+        sig = (st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        cache_key = (str(path), archive_as_rom, *sig)
+
+        cache = getattr(self, "_reconcile_hash_cache", None)
+        lock = getattr(self, "_reconcile_cache_lock", None)
+        if cache is None or lock is None:
+            cache = OrderedDict()
+            lock = threading.Lock()
+            self._reconcile_hash_cache = cache
+            self._reconcile_cache_lock = lock
+
+        with lock:
+            cached = cache.get(cache_key)
+            if cached is not None:
+                cache.move_to_end(cache_key)
+                return cached
+
+        source = _source_for(path, platform)
+        computed: list[dict] = []
+        complete = True
+        for member in source.names():
+            suffix = Path(member.replace("\\", "/")).suffix
+            hashes = source.hash(member, suffix=suffix)
+            if hashes is None:
+                complete = False
+                continue
+            computed.append(hashes)
+        result = tuple(computed)
+
+        st_after = path.stat()
+        if complete and (st_after.st_size, st_after.st_mtime_ns, st_after.st_ctime_ns) == sig:
+            with lock:
+                cache[cache_key] = result
+                cache.move_to_end(cache_key)
+                while len(cache) > self._RECONCILE_CACHE_MAX:
+                    cache.popitem(last=False)
+        return result
+
     def reconcile_platform(self, platform_slug: str = "") -> dict:
         """Drop Wanted entries whose verified dump is already in the library.
 
@@ -3262,7 +3692,7 @@ class ROMarr:
         imported file's name in punctuation, word order or region tags, so it
         survives every import and stays on the Missing tab even though the
         bytes are present and hash-verified. Walks the platform's library dir,
-        verifies each file against the loaded DATs, and fulfils any
+        stream-verifies each file against the loaded DATs, and fulfils any
         same-platform wanted title that maps to a verified dump. Runs after
         each import (scoped to the importing platform) and via
         ``POST /api/v1/collection/reconcile``.
@@ -3271,14 +3701,17 @@ class ROMarr:
             return {"ok": True, "platform": platform_slug, "dropped": 0,
                     "skipped": "acquisition-only mode does not reconcile the outgoing folder"}
 
-        from .library import _source_for
-        from .dat import VERIFIED as _VERIFIED, hash_bytes as _hash_bytes
+        from .dat import VERIFIED as _VERIFIED
 
         platform = resolve(platform_slug)
         if platform is None:
             return {"ok": False,
                     "error": f"unknown platform {platform_slug!r}",
                     "platform": platform_slug, "dropped": 0}
+
+        if self.dats is None or (hasattr(self.dats, "dats") and not self.dats.dats):
+            return {"ok": True, "platform": platform_slug,
+                    "verified": 0, "dropped": [], "count": 0}
 
         verified_titles: set[str] = set()
         for cfg, _ in self.game_libraries:
@@ -3291,14 +3724,8 @@ class ROMarr:
                 if not path.is_file():
                     continue
                 try:
-                    source = _source_for(path, platform)
-                    for member in source.names():
-                        data = source.read(member)
-                        if data is None:
-                            continue
-                        match = self.dats.lookup(**_hash_bytes(
-                            data,
-                            suffix=Path(member.replace("\\", "/")).suffix))
+                    for hashes in self._reconcile_file_hashes(path, platform):
+                        match = self.dats.lookup(**hashes)
                         if match.status == _VERIFIED and match.game:
                             verified_titles.add(match.game)
                 except Exception:  # noqa: BLE001 - one bad file must not stop it
@@ -3314,7 +3741,8 @@ class ROMarr:
             if any(_titles_are_same(w.game, vt) for vt in verified_titles):
                 self.store.fulfil(w.game, w.platform)
                 dropped.append([w.game, w.platform])
-        self.store.save()
+        if dropped:
+            self.store.save()
         return {"ok": True, "platform": platform_slug,
                 "verified": len(verified_titles), "dropped": dropped,
                 "count": len(dropped)}
@@ -5329,7 +5757,7 @@ class ROMarr:
         split = self.library_split()
         return {
             "version": VERSION,
-            "update_available": bool(self.store.settings.get("_update_available")),
+            "update_available": self._update_check_view()["update_available"],
             "latest_version": self.store.settings.get("_latest_version", ""),
             "uptime_seconds": int(time.monotonic() - self._started),
             "library_games": games,
@@ -5381,7 +5809,8 @@ class ROMarr:
             return {"error": "no DATs loaded -- set the DAT directory under "
                              "Settings -> Media Management first"}
 
-        root = platform_dir(self.library, platform,
+        library_root = self.library
+        root = platform_dir(library_root, platform,
                             platform_folders=self.platform_folders())
         state = {"status": "running", "platform": platform.slug,
                  "scanned": 0, "verified": 0, "bad": 0, "unknown": 0,
@@ -5422,7 +5851,7 @@ class ROMarr:
                     state["bad"] += 1
                     if len(state["bad_files"]) < 200:
                         state["bad_files"].append({
-                            "file": str(path.relative_to(self.library)),
+                            "file": path.relative_to(library_root).as_posix(),
                             "detail": verdict.detail or ""})
                 else:
                     state["unknown"] += 1
@@ -5434,7 +5863,7 @@ class ROMarr:
                     self.hashes.add(
                         sha, verdict.game or path.stem, platform.slug,
                         verdict.status == VERIFIED,
-                        str(path.relative_to(self.library)))
+                        path.relative_to(library_root).as_posix())
                 # DAT verification strips copier headers on some platforms.
                 # Quarantine candidates must match every physical byte instead.
                 try:
@@ -5445,11 +5874,11 @@ class ROMarr:
                 key = (raw_sha, raw_size)
                 if key in seen:
                     state["duplicates"].append({
-                        "file": str(path.relative_to(self.library)),
+                        "file": path.relative_to(library_root).as_posix(),
                         "same_as": seen[key], "sha1": raw_sha,
                         "size": raw_size})
                 else:
-                    seen[key] = str(path.relative_to(self.library))
+                    seen[key] = path.relative_to(library_root).as_posix()
             self.hashes.save()
             state["status"] = "done"
             state["indexed"] = len(self.hashes)
@@ -5479,7 +5908,8 @@ class ROMarr:
         state = self._audit_state or {}
         if state.get("status") != "done" or state.get("platform") != platform_slug:
             return {"error": "run a completed audit for this platform first"}
-        root = self.library / platform_slug
+        root = platform_dir(self.library, platform_slug,
+                            platform_folders=self.platform_folders())
         if not root.is_dir():
             return {"error": "audited platform directory is unavailable"}
         try:
@@ -5507,6 +5937,17 @@ class ROMarr:
         return (self.library_root(cfg).resolve(), self.library_layout(cfg),
                 str(cfg.get("id") or ""))
 
+    def _library_rename_folders(self, platform_slug: str) -> dict[str, str]:
+        """Return effective `platform_folders` overrides for the routed rename library."""
+        configured = getattr(self, "game_libraries", None) or []
+        if not configured:
+            return self.platform_folders()
+        routed = self.library_for(platform_slug)
+        if routed is None:
+            return self.platform_folders()
+        cfg, _backend = routed
+        return self.platform_folders(cfg)
+
     def _library_rename_roots(self) -> list[Path]:
         roots = [Path(self.library)]
         roots.extend(self.library_root(cfg)
@@ -5528,6 +5969,7 @@ class ROMarr:
                                 scope: str = "", offset: int = 0) -> dict:
         """Build a DAT-verified, read-only preview in a background thread."""
         import threading as _threading
+        from .library_rename import plan, resolve_platform_folder
 
         active = getattr(self, "_library_rename_thread", None)
         if active is not None and active.is_alive():
@@ -5540,10 +5982,13 @@ class ROMarr:
             return {"error": "load DATs under Settings -> Media Management first"}
         try:
             library_root, layout, library_id = self._library_rename_target(platform.slug)
+            folders = self._library_rename_folders(platform.slug)
+            expected_folder = resolve_platform_folder(platform.slug, folders)
         except (OSError, ValueError) as err:
             return {"error": str(err)}
         dats = self.dats
         state = {"status": "running", "platform": platform.slug,
+                 "folder": expected_folder,
                  "library_id": library_id, "layout": layout,
                  "scanned": 0, "entries": []}
         self._library_rename_root = library_root
@@ -5551,9 +5996,10 @@ class ROMarr:
 
         def run():
             try:
-                from .library_rename import plan
+                kwargs = {"platform_folders": folders} if folders else {}
                 state.update(plan(library_root, platform.slug, dats,
-                                   scope=scope, offset=offset, layout=layout))
+                                   scope=scope, offset=offset, layout=layout,
+                                   **kwargs))
             except (OSError, ValueError) as err:
                 state.update(status="failed", error=str(err))
 
@@ -5577,7 +6023,7 @@ class ROMarr:
     def apply_library_renames(self, platform_slug: str,
                               files: list[str]) -> dict:
         import uuid as _uuid
-        from .library_rename import apply, manifest_for
+        from .library_rename import apply, manifest_for, resolve_platform_folder
         state = getattr(self, "_library_rename_state", {}) or {}
         if state.get("status") != "done" or state.get("platform") != platform_slug:
             return {"error": "run a completed preview for this platform first"}
@@ -5587,12 +6033,18 @@ class ROMarr:
         manifest_id = _uuid.uuid4().hex
         try:
             current_root, current_layout, current_id = self._library_rename_target(platform_slug)
+            current_folders = self._library_rename_folders(platform_slug)
+            current_folder = resolve_platform_folder(platform_slug, current_folders)
             if (current_root != Path(preview_root).resolve()
                     or current_layout != state.get("layout", "flat")
-                    or current_id != state.get("library_id", "")):
-                return {"error": "library route or layout changed since preview; run a new preview"}
+                    or current_id != state.get("library_id", "")
+                    or current_folder != state.get("folder", current_folder)):
+                return {"error": "library route, folder, or layout changed since preview; run a new preview"}
+            apply_kwargs = ({"platform_folders": current_folders}
+                            if current_folders else {})
             result = apply(preview_root, platform_slug, files,
-                           state.get("entries") or [], manifest_id=manifest_id)
+                           state.get("entries") or [], manifest_id=manifest_id,
+                           **apply_kwargs)
             self.hashes.move_paths({
                 entry["original"]: entry["target"]
                 for entry in result.get("entries", [])
@@ -5600,6 +6052,7 @@ class ROMarr:
                 root=preview_root)
             self._library_rename_state = {
                 "status": "applied", "platform": platform_slug,
+                "folder": current_folder,
                 "library_id": current_id, "layout": current_layout,
                 "entries": result.get("entries", [])}
             ROMarr._audit_state = {
@@ -5805,96 +6258,208 @@ class ROMarr:
             base = f"{scheme}://{request_host}"
         return f"{base}/oidc/callback" if base else "/oidc/callback"
 
-    def check_update(self) -> dict:
-        """Ask github.com whether a newer ROMarr exists, and -- only when the
-        operator turned auto_update on -- apply it through apply_update()."""
+    def _record_update_check(self, state: str, reason: str, *,
+                             checked_channel: str,
+                             latest: str = "", error: str = "") -> None:
+        """Persist one completed check without erasing the last good comparison.
+
+        The legacy Boolean is cleared for unknown/error outcomes, rather than
+        presenting a cached availability flag as a new successful check.
+        """
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self._lock:
+            settings = self.store.settings
+            settings["_update_state"] = state
+            settings["_update_reason"] = reason
+            settings["_update_last_attempt"] = stamp
+            settings["_update_error"] = error
+            settings["_update_checked_version"] = VERSION
+            settings["_update_checked_channel"] = checked_channel
+            settings["_update_available"] = state == "available"
+            if latest:
+                settings["_latest_version"] = latest
+            if state in ("current", "available"):
+                settings["_update_last_success"] = stamp
+            self.store.save()
+
+    def _update_check_view(self) -> dict:
+        """Snapshot the check verdict; invalidate it after a build/channel change."""
+        with self._lock:
+            settings = dict(self.store.settings)
+        channel = str(settings.get("update_channel") or "stable").lower()
+        state = str(settings.get("_update_state") or "never_checked")
+        reason = str(settings.get("_update_reason") or "not_checked")
+        if state not in ("never_checked", "available", "current", "unknown", "error"):
+            state, reason = "unknown", "invalid_saved_status"
+        elif state in ("available", "current") and not _comparable_version(VERSION):
+            state, reason = "unknown", "running_version_unknown"
+        elif state in ("available", "current") and (
+                get_build_info(VERSION).get("type") == "development"):
+            state, reason = "unknown", "development_build"
+        elif state != "never_checked" and (
+                settings.get("_update_checked_version") != VERSION
+                or settings.get("_update_checked_channel") != channel):
+            state, reason = "unknown", "build_or_channel_changed"
+        return {
+            "state": state,
+            "reason": reason,
+            "channel": channel,
+            "last_attempt_at": settings.get("_update_last_attempt") or "",
+            "last_success_at": settings.get("_update_last_success") or "",
+            "last_error": (settings.get("_update_error") or ""
+                           if state == "error" else ""),
+            "latest_version": settings.get("_latest_version") or "",
+            "update_available": state == "available",
+            "in_progress": self._update_check_lock.locked(),
+        }
+
+    def check_update(self, *, manual: bool = False) -> dict:
+        """Check the stable release without concurrent requests or stale writes.
+
+        The explicit command is check-only; the daily scheduler may notify or
+        apply under the existing opt-in. Nightly revision discovery is separate.
+        """
         import requests as _requests
-        headers = {"Accept": "application/vnd.github+json"}
-        # Unauthenticated GitHub API calls are rate limited to 60/hour per
-        # IP, and a homelab NAT shares one IP across every container that
-        # ever touched the API. A token lifts that to 5,000/hour; without
-        # one a 403 is almost always the limit, and saying "could not
-        # reach github.com" sent operators hunting for a network fault
-        # that did not exist.
-        token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+
+        # A scheduled daily sweep must not be skipped because a manual check
+        # already owns the request; wait for it and perform scheduled actions.
+        # Manual callers return busy immediately rather than block the UI.
+        if not self._update_check_lock.acquire(blocking=not manual):
+            return {"ok": False, "busy": True, "update_available": False,
+                    "message": "an update check is already in progress"}
         try:
-            response = _requests.get(self.RELEASES_URL, timeout=10,
-                                     headers=headers)
-            if response.status_code in (403, 429) and not token:
-                reset = response.headers.get("X-RateLimit-Reset") or ""
-                return {"ok": False,
-                        "message": "github.com rate-limited this address "
+            with self._lock:
+                channel = str(self.store.settings.get("update_channel")
+                              or "stable").lower()
+            if channel != "stable":
+                # A stable release endpoint cannot answer whether the Git
+                # source revision on the nightly channel has advanced.
+                reason = ("nightly_revision_not_checked" if channel == "nightly"
+                          else "unsupported_update_channel")
+                self._record_update_check("unknown", reason,
+                                          checked_channel=channel)
+                message = ("nightly revision checking is not yet supported; "
+                           "no stable-release request was made" if channel == "nightly"
+                           else f"unknown update channel {channel!r}; no check was made")
+                return {"ok": True, "state": "unknown", "latest": "",
+                        "indeterminate": True, "update_available": False,
+                        "message": message}
+
+            def failed(reason: str, message: str) -> dict:
+                """Record a failed attempt while retaining the last good release."""
+                self._record_update_check("error", reason,
+                                          checked_channel=channel,
+                                          error=message)
+                return {"ok": False, "state": "error", "reason": reason,
+                        "update_available": False, "message": message}
+
+            headers = {"Accept": "application/vnd.github+json"}
+            token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            try:
+                response = _requests.get(self.RELEASES_URL, timeout=10,
+                                         headers=headers)
+                if response.status_code in (403, 429):
+                    reset = response.headers.get("X-RateLimit-Reset") or ""
+                    if response.status_code == 429 or not token:
+                        message = ("github.com rate-limited this address "
                                    "(unauthenticated API: 60 requests/hour "
                                    "per IP, shared across your network). "
                                    "Set GITHUB_TOKEN in the environment to "
-                                   "lift it to 5,000/hour"
-                                   + (f"; limit resets at {reset}" if reset
-                                      else "")}
-            response.raise_for_status()
-            body = response.json()
-        except Exception as err:
-            return {"ok": False,
-                    "message": f"could not reach github.com: {err.__class__.__name__}"}
-        latest = str(body.get("tag_name") or "").lstrip("vV")
-        url = str(body.get("html_url") or "")
-        if not latest:
-            return {"ok": False, "message": "github.com answered without a tag"}
+                                   "lift it to 5,000/hour" if not token else
+                                   "github.com rate-limited the update check")
+                        if reset:
+                            message += f"; limit resets at {reset}"
+                        return failed("rate_limited", message)
+                    return failed("request_denied",
+                                  "github.com denied the update check (HTTP 403)")
+                response.raise_for_status()
+                body = response.json()
+            except Exception as err:
+                return failed("request_failed",
+                              f"could not reach github.com: {err.__class__.__name__}")
 
-        if is_unknown(VERSION):
-            # Refuse before any side effect, never after. Every real release
-            # outranks 0.0.0+unknown, so this build would otherwise report a
-            # permanent update, notify once per release about news it cannot
-            # verify, and -- with auto_update on -- start an update from a
-            # version it cannot name. Record "no update" so a stale banner from
-            # a previous build clears, and say plainly why nothing was done.
-            self.store.settings["_latest_version"] = latest
-            self.store.settings["_update_available"] = False
-            self.store.save()
-            return {"ok": True, "latest": latest, "update_available": False,
-                    "indeterminate": True,
-                    "message": (f"latest is {latest}; this build does not know its "
-                                f"own version, so it cannot say whether it is "
-                                f"behind, and nothing was changed")}
+            if not isinstance(body, dict):
+                return failed("invalid_response", "github.com returned invalid release data")
+            latest = str(body.get("tag_name") or "").lstrip("vV")
+            url = str(body.get("html_url") or "")
+            if not _comparable_version(latest):
+                return failed("invalid_release",
+                              "github.com answered without a valid release tag")
 
-        # compare_key normalizes trailing zeros, ranks a final release above
-        # its prereleases, and ranks .post releases after the release they patch.
-        newer = compare_key(latest) > compare_key(VERSION)
-        self.store.settings["_latest_version"] = latest
-        self.store.settings["_update_available"] = newer
-        if newer and self.store.settings.get("_update_notified") != latest:
-            # Once per version, not once per day: the daily check repeating
-            # the same news is an alarm everybody learns to ignore.
-            self.store.settings["_update_notified"] = latest
-            self.notify(update_available(VERSION, latest, url))
-        self.store.save()
-        # Auto-apply is the operator's explicit choice, checked once per day
-        # here and never in a request path. A busy queue defers to the next
-        # sweep rather than restarting mid-import.
-        if newer and self.store.settings.get("auto_update", False):
-            applied = self.apply_update()
-            if applied.get("ok"):
-                return {"ok": True, "latest": latest, "update_available": True,
-                        "message": applied["message"]}
-            message = (f"{latest} is available; auto-update did not run: "
-                       f"{applied.get('error', '')}")
-            return {"ok": True, "latest": latest, "update_available": True,
-                    "message": message}
-        message = (f"{latest} is available (running {VERSION})" if newer
-                   else f"up to date ({VERSION})")
-        return {"ok": True, "latest": latest, "update_available": newer,
-                "message": message}
+            with self._lock:
+                active_channel = str(self.store.settings.get("update_channel")
+                                     or "stable").lower()
+            if active_channel != channel:
+                self._record_update_check("unknown", "channel_changed_during_check",
+                                          latest=latest, checked_channel=channel)
+                return {"ok": True, "state": "unknown", "latest": latest,
+                        "indeterminate": True, "update_available": False,
+                        "message": "update channel changed during the check; no action taken"}
+            development = get_build_info(VERSION).get("type") == "development"
+            if not _comparable_version(VERSION) or development:
+                reason = ("development_build" if development
+                          else "running_version_unknown")
+                self._record_update_check("unknown", reason,
+                                          latest=latest, checked_channel=channel)
+                message = (f"latest stable release is {latest}; this is a "
+                           "development build, so stable update availability "
+                           "is unknown and nothing was changed" if development else
+                           f"latest is {latest}; this build does not know its "
+                           "own version, so it cannot say whether it is "
+                           "behind, and nothing was changed")
+                return {"ok": True, "state": "unknown", "latest": latest,
+                        "indeterminate": True, "update_available": False,
+                        "message": message}
 
-    def apply_update(self) -> dict:
-        """Update THIS ROMarr from its own GitHub repo, now.
+            newer = compare_key(latest) > compare_key(VERSION)
+            state = "available" if newer else "current"
+            self._record_update_check(state, "stable_release_version",
+                                      latest=latest, checked_channel=channel)
 
-        git installs: resolve the channel's target ref, refuse while the
-        queue is busy, then launch the detached updater (fetch, ff-only
-        merge, pip, service restart). Docker installs: cannot, and the
-        reply says exactly what the host must run instead. Nothing here
-        guesses -- the install shape is detected, and an unknown shape
-        refuses with the reason.
+            if newer and not manual:
+                with self._lock:
+                    # Disabled scheduled checks must not send notifications
+                    # or consume the one-per-version notification marker.
+                    should_notify = (
+                        str(self.store.settings.get("update_channel")
+                            or "stable").lower() == channel
+                        and self.store.settings.get("update_check", True)
+                        and self.store.settings.get("_update_notified") != latest)
+                    if should_notify:
+                        self.store.settings["_update_notified"] = latest
+                        self.store.save()
+                if should_notify:
+                    self.notify(update_available(VERSION, latest, url))
+
+                if (self.store.settings.get("update_check", True)
+                        and self.store.settings.get("auto_update", False)):
+                    applied = self.apply_update(expected_channel=channel,
+                                                expected_release=latest)
+                    if applied.get("ok"):
+                        return {"ok": True, "state": state, "latest": latest,
+                                "update_available": True,
+                                "message": applied["message"]}
+                    return {"ok": True, "state": state, "latest": latest,
+                            "update_available": True,
+                            "message": (f"{latest} is available; auto-update did "
+                                        f"not run: {applied.get('error', '')}")}
+
+            message = (f"{latest} is available (running {VERSION})" if newer
+                       else f"up to date ({VERSION})")
+            return {"ok": True, "state": state, "latest": latest,
+                    "update_available": newer, "message": message}
+        finally:
+            self._update_check_lock.release()
+
+    def apply_update(self, *, expected_channel: str = "",
+                     expected_release: str = "") -> dict:
+        """Launch an explicit Git update; scheduled calls pin the checked target.
+
+        The optional expectation is only passed by a completed stable check.
+        Manual ApplyUpdate retains its original setting-driven behavior. The
+        channel, queue and target are validated under one lock through launch.
         """
         from . import selfupdate
 
@@ -5903,32 +6468,38 @@ class ROMarr:
             return selfupdate.docker_guidance()
         if not env.can_apply:
             return {"ok": False, "error": env.detail}
-        channel = str(self.store.settings.get("update_channel")
-                      or "stable").lower()
-        if channel not in ("stable", "nightly"):
-            return {"ok": False, "error": f"unknown update channel {channel!r}"}
         with self._lock:
-            # The stall timeout is passed so a grabbed row that died days ago
-            # does not defer the update forever -- see queue_busy.
+            channel = str(self.store.settings.get("update_channel")
+                          or "stable").lower()
+            if channel not in ("stable", "nightly"):
+                return {"ok": False, "error": f"unknown update channel {channel!r}"}
+            if expected_channel and (
+                    channel != expected_channel
+                    or not self.store.settings.get("auto_update", False)
+                    or not self.store.settings.get("update_check", True)
+                    or self.store.settings.get("_latest_version") != expected_release):
+                return {"ok": False,
+                        "error": "update channel, release or scheduled update preference "
+                                 "changed after the check; update not launched"}
             try:
                 stall = int(self.store.settings.get(
                     "stalled_timeout_minutes") or 0)
             except (TypeError, ValueError):
                 stall = 0
-            busy = selfupdate.queue_busy(self.queue, stall_minutes=stall)
-        if busy:
-            return {"ok": False, "deferred": True,
-                    "error": "downloads or imports are in flight; the update "
-                             "will apply on the next daily check"}
-        latest = str(self.store.settings.get("_latest_version") or "")
-        if channel == "nightly":
-            # Nightly tracks main, so "newer" is not a version question:
-            # fetch and let --ff-only decide whether anything moved.
-            latest = latest or VERSION
-        target, why = selfupdate.resolve_target(env, channel, latest)
-        if not target:
-            return {"ok": False, "error": why}
-        result = selfupdate.launch(env, target)
+            if selfupdate.queue_busy(self.queue, stall_minutes=stall):
+                return {"ok": False, "deferred": True,
+                        "error": "downloads or imports are in flight; the update "
+                                 "will apply on the next daily check"}
+            latest = (expected_release if expected_channel else
+                      str(self.store.settings.get("_latest_version") or ""))
+            if channel == "nightly":
+                latest = latest or VERSION
+            target, why = selfupdate.resolve_target(env, channel, latest)
+            if not target:
+                return {"ok": False, "error": why}
+            # The same lock protects HTTP settings writes. The target remains
+            # pinned to the checked release, never re-read as origin/main.
+            result = selfupdate.launch(env, target)
         if result.get("ok"):
             self.store.record(Event(kind="update", game="", platform="",
                                     release=VERSION,
@@ -5938,27 +6509,47 @@ class ROMarr:
         return result
 
     def update_status(self) -> dict:
-        """Everything the Update page shows: install shape, channel, the
-        last check's verdict, and the tail of the last self-update log."""
+        """Expose the current verdict separately from cached release and errors."""
         from . import selfupdate
 
         env = selfupdate.detect()
+        check = self._update_check_view()
+        configured = bool(self.store.settings.get("auto_update", False))
+        scheduled = bool(self.store.settings.get("update_check", True))
+        development = get_build_info(VERSION).get("type") == "development"
+        effective = (configured and scheduled and env.can_apply
+                     and check["channel"] == "stable"
+                     and _comparable_version(VERSION) and not development)
+        if not configured:
+            capability_reason = "disabled"
+        elif not scheduled:
+            capability_reason = "update_check_disabled"
+        elif not env.can_apply:
+            capability_reason = "install_cannot_self_update"
+        elif check["channel"] != "stable":
+            capability_reason = "nightly_revision_check_not_supported"
+        elif not _comparable_version(VERSION):
+            capability_reason = "running_version_unknown"
+        elif development:
+            capability_reason = "development_build"
+        else:
+            capability_reason = "enabled"
         return {
             "running_version": VERSION,
             "build": get_build_info(VERSION),
-            "latest_version": self.store.settings.get("_latest_version") or "",
-            "update_available": bool(
-                self.store.settings.get("_update_available")),
+            "latest_version": check["latest_version"],
+            "update_available": check["update_available"],
+            "check_status": {key: value for key, value in check.items()
+                             if key not in ("latest_version", "update_available")},
             "install": {"kind": env.kind, "detail": env.detail,
                         "branch": env.branch, "commit": env.commit,
                         "repo": env.repo, "can_apply": env.can_apply},
             "settings": {
-                "update_check": bool(
-                    self.store.settings.get("update_check", True)),
-                "auto_update": bool(
-                    self.store.settings.get("auto_update", False)),
-                "update_channel": str(
-                    self.store.settings.get("update_channel") or "stable"),
+                "update_check": scheduled,
+                "auto_update": configured,
+                "auto_update_effective": effective,
+                "auto_update_reason": capability_reason,
+                "update_channel": check["channel"],
                 "auto_update_plugins": bool(
                     self.store.settings.get("auto_update_plugins", False)),
             },
@@ -6405,7 +6996,7 @@ class ROMarr:
         if name == "ListSync":
             return self.list_sync()
         if name == "UpdateCheck":
-            return self.check_update()
+            return self.check_update(manual=True)
         if name == "ApplyUpdate":
             return self.apply_update()
         if name == "PluginUpdate":
@@ -6623,6 +7214,14 @@ class ROMarr:
             name = torrent.get("name", "")
             platform = None
             queue_item = None
+            source_client = torrent.get("_romarr_client")
+            client_id = str(
+                getattr(source_client, "romarr_id", "")
+                or getattr(source_client, "config_id", "")
+                or torrent.get("_romarr_client_id")
+                or ""
+            )
+            client_protocol = str(getattr(source_client, "protocol", "") or "")
             with self._lock:
                 try:
                     candidates = self.queue
@@ -6631,7 +7230,8 @@ class ROMarr:
                                       if q.download_client == getattr(torrent["hub_client"], "romarr_id", "")
                                       and q.download_id == torrent.get("id")
                                       and q.state == "grabbed"]
-                    match = match_queue_item(candidates, torrent)
+                    match = match_queue_item(candidates, torrent, client_id=client_id,
+                                             client_protocol=client_protocol)
                 except AmbiguousQueueMatch as err:
                     # A shared torrent cannot be assigned safely to one pending request.
                     for item in err.items:
@@ -6745,6 +7345,7 @@ class ROMarr:
             target_cfg, target_lib = target
             label = target_cfg.get("name") or getattr(target_lib, "name", "library")
 
+            target_folders = self.platform_folders(target_cfg)
             selected_primaries = None
             bundle_routes = None
             if queue_item is not None and path.exists():
@@ -6756,11 +7357,11 @@ class ROMarr:
                 try:
                     preview = preview_import(path, platform, self.library_root(target_cfg),
                                              layout=self.library_layout(target_cfg),
-                                             platform_folders=self.platform_folders(target_cfg),
+                                             platform_folders=target_folders,
                                              queue_identity=queue_identity(queue_item))
                     preview = decorate_preview(preview, platform, self.library_root(target_cfg),
                                                kind=target_cfg.get("type", ""), layout=self.library_layout(target_cfg),
-                                               platform_folders=self.platform_folders(target_cfg), translation=is_translation(name))
+                                               platform_folders=target_folders, translation=is_translation(name))
                 except (OSError, ValueError, RuntimeError, MissingArchiveTool,
                         zipfile.BadZipFile, subprocess.SubprocessError) as exc:
                     # A bad archive belongs to this row, not to every completed
@@ -6798,7 +7399,7 @@ class ROMarr:
                 prefer_hardlinks=bool(self.store.settings.get("prefer_hardlinks", False)),
                 layout=self.library_layout(target_cfg),
                 translation=is_translation(name),
-                platform_folders=self.platform_folders(target_cfg),
+                platform_folders=target_folders,
                 export_only=self.store.settings.get("standalone_export", False),
                 **({"selected_primaries": selected_primaries} if selected_primaries is not None else {}),
                 **({"bundle_routes": bundle_routes} if bundle_routes is not None else {}))
@@ -6861,7 +7462,8 @@ class ROMarr:
             if all_ok:
                 if (not self.store.settings.get("acquisition_only", False)
                         and self.store.settings.get("rescan_after_import", True)):
-                    target_lib.rescan(platform.slug)
+                    self._rescan_library(target_lib, target_cfg, platform.slug,
+                                         platform_folders=target_folders)
                 # The absolute destinations this release was imported to.
                 # Cartridge streams them back to the player; external
                 # platforms poll the assets endpoint.
@@ -6957,7 +7559,9 @@ def is_portal_subpath(path: str) -> bool:
 
 
 def make_handler(service: ROMarr):
+    """Build the HTTP request handler class bound to `service`."""
     class Handler(BaseHTTPRequestHandler):
+        """HTTP handler serving the ROMarr UI and REST API endpoints."""
         server_version = "ROMarr"
         _is_portal_subpath = staticmethod(is_portal_subpath)
 
@@ -7285,6 +7889,7 @@ def make_handler(service: ROMarr):
             return self._gate(self._delete)
 
         def _get(self):
+            """Serve UI HTML pages and JSON API GET endpoints."""
             route = urlparse(self.path)
             query = parse_qs(route.query)
             if route.path in ("/favicon.ico", "/favicon.svg"):
@@ -7345,8 +7950,7 @@ def make_handler(service: ROMarr):
             if route.path == "/api/v1/queue/import-plan":
                 return self._json(200, service.queue_import_plan(int((query.get("index") or ["-1"])[0]), {}))
             if route.path == "/api/v1/queue":
-                return self._json(200, {"items": [{**asdict(i), "display_release": service.queue_display_release(i),
-                                                    "hub": service._is_hub_row(i)} for i in service.queue]})
+                return self._json(200, {"items": service.queue_rows()})
             if route.path == "/api/v1/history":
                 limit = int((query.get("limit") or ["100"])[0])
                 return self._json(200, {"items": service.store.history(limit)})
@@ -8007,8 +8611,10 @@ def make_handler(service: ROMarr):
                 except ValueError as exc:
                     return self._json(400, {"error": str(exc)})
                 with service._metadata_lock:
-                    service.store.settings.update(settings)
-                    service.store.save()
+                    # Keep restore preferences serialized with update launch.
+                    with service._lock:
+                        service.store.settings.update(settings)
+                        service.store.save()
                     service.reload_metadata()
                     service.reload_clients()
                     service.reload_libraries()
@@ -8832,7 +9438,9 @@ def make_handler(service: ROMarr):
                 secret = body.get("_oidc_client_secret")
                 if "_oidc_client_secret" in body and secret in ("", "********"):
                     body.pop("_oidc_client_secret")
-                updated = service.store.update_settings(body)
+                # Serialize public settings writes with the updater launch.
+                with service._lock:
+                    updated = service.store.update_settings(body)
                 if any(str(k).startswith("oidc") or k == "_oidc_client_secret"
                        for k in body):
                     # An SSO change takes effect at the next login attempt,

@@ -127,3 +127,31 @@ def test_request_identity_takes_precedence_over_shared_release_hash():
     first.download_id = "request-a"
     second.download_id = "request-b"
     assert match_queue_item([first, second], {"hash": HASH, "id": "request-b"}) is second
+
+
+@pytest.mark.parametrize("client_id,protocol", [("second", "torrent"), ("", "usenet")])
+def test_reporting_client_rejects_incompatible_identity(client_id, protocol):
+    """Shared hashes cannot override client or protocol ownership."""
+    item = row("Game", "grabbed")
+    item.download_client = "first"
+    assert match_queue_item([item], {"hash": HASH}, client_id=client_id,
+                            client_protocol=protocol) is None
+
+
+def test_ambiguous_download_hides_preview_and_returns_actionable_error(tmp_path):
+    """Preview reads preserve pending rows and refuse ambiguous identities."""
+    service = ROMarr({"ROMARR_DATA": str(tmp_path / "state.json"),
+                      "LIBRARY_KIND": "folder", "LIBRARY_PATH": str(tmp_path / "library")})
+    service.queue.extend([row("A", "grabbed"), row("B", "grabbed")])
+
+    class Client:
+        configured = True
+
+        def completed(self):
+            """Report one download shared by the two pending rows."""
+            return [{"name": "Demo.sfc", "hash": HASH}]
+
+    service.clients = [Client()]
+    assert [item["can_preview_import"] for item in service.queue_rows()] == [False, False]
+    assert "resolve duplicate queue entries" in service.queue_import_plan(0, {})["error"]
+    assert [item.state for item in service.queue] == ["grabbed", "grabbed"]
