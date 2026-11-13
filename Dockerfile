@@ -28,7 +28,7 @@ RUN pip install --no-cache-dir --prefix=/install -r /tmp/requirements.txt
 ARG TARGETARCH
 RUN if [ "$TARGETARCH" != "arm" ]; then \
       pip install --no-cache-dir --prefix=/install \
-        "rom-hub @ https://github.com/dgmora/rom-hub/archive/2c66cd22d24a8ec4861a74d7b47f23eab2a8d7ca.tar.gz"; \
+        "rom-hub @ https://github.com/dgmora/rom-hub/archive/02e9a1dbc7ebca5191b4a977233a4d6d0466ed4b.tar.gz"; \
     fi
 
 

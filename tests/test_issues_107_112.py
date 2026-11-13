@@ -355,12 +355,15 @@ def test_issue_107_ui_local_timezone_helpers():
 
 # ------------------------------------------------------------------ #93 ---
 
-def test_rom_hub_authentication_pin_matches_installation_docs():
+def test_rom_hub_fork_pin_matches_installation_docs():
+    """All installation paths use our fork at the adopted Hub revision."""
     root = pathlib.Path(__file__).resolve().parents[1]
-    expected_sha = "2c66cd22d24a8ec4861a74d7b47f23eab2a8d7ca"
-    for rel in ("Dockerfile", "Dockerfile.browser", "docs/PLUGINS.md"):
+    expected_sha = "02e9a1dbc7ebca5191b4a977233a4d6d0466ed4b"
+    for rel in ("Dockerfile", "Dockerfile.browser", "docs/PLUGINS.md", "docs/INSTALL.md",
+                "scripts/build-windows-desktop.ps1", ".github/workflows/docker.yml"):
         content = (root / rel).read_text(encoding="utf-8")
         assert expected_sha in content, f"{rel} does not pin {expected_sha}"
+        assert "github.com/dgmora/rom-hub" in content, f"{rel} does not use our fork"
 
 
 def test_portal_proxy_same_origin_shield_and_ssrf_guard(tmp_path, monkeypatch):

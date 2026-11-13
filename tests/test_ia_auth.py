@@ -177,3 +177,21 @@ def test_authenticated_search_failure_preserves_anonymous_filtering(root, monkey
     results, error = hub.search("Game", platform="snes", limit=1)
     assert [row["title"] for row in results] == ["First.sfc"]
     assert "unavailable" in error
+
+
+def test_plugin_reported_failure_is_visible(root, monkeypatch):
+    from types import SimpleNamespace
+    from romarr import hub
+    from rom_hub.dispatcher import PluginStatus, SearchOutcome
+
+    monkeypatch.setattr(hub, "HOME", root)
+    monkeypatch.setattr(hub, "_unsandboxed", lambda: True)
+    plugin = SimpleNamespace(slug="archive-org", enabled=True,
+                             manifest=SimpleNamespace(capabilities=["search"]))
+    monkeypatch.setattr("rom_hub.registry.Registry.installed", lambda self: [plugin])
+    monkeypatch.setattr("rom_hub.dispatcher.search_all", lambda *args, **kwargs:
+                        SearchOutcome(results=[], statuses=[PluginStatus(
+                            "archive-org", False, 0, "Archive.org rejected the login")]))
+    rows, error = hub.search("Game", platform="psx")
+    assert rows == []
+    assert "Archive.org rejected the login" in error
