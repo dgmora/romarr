@@ -311,6 +311,19 @@ def test_partial_hub_search_warning_keeps_healthy_rows(tmp_path, monkeypatch):
 
 def test_search_falls_back_when_ia_modules_are_absent(tmp_path, monkeypatch):
     """Exercise optional authentication using an isolated plugin registry."""
+    import httpx
+    from rom_hub.broker.fetcher import HttpxFetcher
+
+    def unexpected_request(request):
+        """Reject HTTP requests in this dispatcher-only test."""
+        raise AssertionError(f"Unexpected HTTP request: {request.url}")
+
+    def create_fetcher(timeout, transport):
+        """Keep the real fetcher with an offline transport."""
+        assert transport is None
+        return HttpxFetcher(timeout=timeout, transport=httpx.MockTransport(unexpected_request))
+
+    monkeypatch.setattr("rom_hub.broker.fetcher.HttpxFetcher", create_fetcher)
     monkeypatch.setattr(hub, "HOME", tmp_path)
     import sys
     from types import SimpleNamespace

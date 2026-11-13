@@ -184,6 +184,19 @@ def test_plugin_reported_failure_is_visible(root, monkeypatch):
     from romarr import hub
     from rom_hub.dispatcher import PluginStatus, SearchOutcome
 
+    import httpx
+    from rom_hub.broker.fetcher import HttpxFetcher
+
+    def unexpected_request(request):
+        """Reject HTTP requests in this dispatcher-only test."""
+        raise AssertionError(f"Unexpected HTTP request: {request.url}")
+
+    def create_fetcher(timeout, transport):
+        """Keep the real fetcher with an offline transport."""
+        assert transport is None
+        return HttpxFetcher(timeout=timeout, transport=httpx.MockTransport(unexpected_request))
+
+    monkeypatch.setattr("rom_hub.broker.fetcher.HttpxFetcher", create_fetcher)
     monkeypatch.setattr(hub, "HOME", root)
     monkeypatch.setattr(hub, "_unsandboxed", lambda: True)
     plugin = SimpleNamespace(slug="archive-org", enabled=True,
