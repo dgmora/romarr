@@ -25,14 +25,89 @@ OFFICIAL_REMOTES = frozenset({
     "git@github.com:BlizzHacker/romarr.git",
     "ssh://git@github.com/BlizzHacker/romarr.git",
 })
-SAFE_REF = re.compile(r"(?:refs/tags/v[A-Za-z0-9][A-Za-z0-9._+-]*|origin/main)\Z")
+SAFE_REF = re.compile(r"(?:refs/tags/v[A-Za-z0-9][A-Za-z0-9._+-]*|origin/main|refs/pull/[1-9][0-9]{0,5}/head|refs/romarr/rollback/[a-f0-9]{32})\Z")
 SAFE_SERVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]*\Z")
 
 
+_BUILD_STAMP = r"""import os,re,subprocess,sys,tempfile
+from pathlib import Path
+root=Path.cwd();package=root/'romarr'
+if not package.is_dir() or package.is_symlink():
+    raise ValueError('Missing or linked ROMarr package; identity not written')
+target,revision=sys.argv[1:]
+actual=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+if actual!=revision or not re.fullmatch('[0-9a-f]{40}',revision):
+    raise ValueError('Source changed before identity publication')
+pattern=re.compile(r'v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(alpha|beta|rc)\.(0|[1-9]\d*))?\Z')
+version='0.0.0+unknown';kind='development';ref=target
+if target.startswith('refs/romarr/rollback/'):
+    tags=subprocess.check_output(['git','tag','--points-at',revision],text=True).splitlines()
+    tags=[tag for tag in tags if pattern.fullmatch(tag)]
+    if tags:
+        rank={'alpha':0,'beta':1,'rc':2,None:3}
+        def key(tag):
+            a,b,c,stage,number=pattern.fullmatch(tag).groups()
+            return int(a),int(b),int(c),rank[stage],int(number or 0)
+        ref='refs/tags/'+max(tags,key=key)
+    else:
+        ref='refs/heads/'+subprocess.check_output(['git','symbolic-ref','--short','HEAD'],text=True).strip()
+elif target=='origin/main':
+    ref='refs/heads/main'
+if ref.startswith('refs/tags/'):
+    tag=ref[len('refs/tags/'):]
+    if not pattern.fullmatch(tag):
+        raise ValueError('Unsupported release version; identity not written')
+    tagged=subprocess.check_output(['git','rev-parse','--verify',ref+'^{commit}'],text=True).strip()
+    if tagged!=revision:
+        raise ValueError('Release tag changed before identity publication')
+    kind='release';version=tag[1:]
+fields={'romarr_build_kind':kind,'romarr_source_ref':ref,'romarr_source_revision':revision,'romarr_source_repository':'BlizzHacker/romarr'}
+outputs={package/'_version.py':'__version__ = '+repr(version)+'\n',package/'_build_info.py':''.join(k+' = '+repr(v)+'\n' for k,v in fields.items())}
+for path in outputs:
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ValueError('Build metadata must be regular files')
+    if subprocess.run(['git','check-ignore','-q','--',str(path.relative_to(root))]).returncode:
+        raise ValueError('Generated metadata must be ignored by Git')
+for path,content in outputs.items():
+    descriptor,name=tempfile.mkstemp(prefix='.romarr-identity-',dir=package)
+    temporary=Path(name)
+    try:
+        os.fchmod(descriptor,0o644)
+        with os.fdopen(descriptor,'w') as output:
+            output.write(content);output.flush();os.fsync(output.fileno())
+        if path.is_symlink():
+            raise ValueError('Build metadata changed during publication')
+        os.replace(temporary,path)
+    finally:
+        temporary.unlink(missing_ok=True)
+"""
+
+_GIT_LOCATION_OVERRIDES = frozenset({
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
+})
+
+
+def _safe_git_env() -> dict[str, str]:
+    """Omit inherited repository-location overrides from Git probes and workers."""
+    return {key: value for key, value in os.environ.items()
+            if key not in _GIT_LOCATION_OVERRIDES}
+
+
+def _is_ssh_remote(remote: str) -> bool:
+    """Detect URL and Git SCP-style SSH origins without blocking local paths."""
+    if remote.startswith(("ssh://", "git+ssh://", "ssh+git://", "git@")):
+        return True
+    # Git recognizes host:path and user@host:path as SSH transport. Absolute
+    # and ./relative filesystem paths containing colons are not remote hosts.
+    return ("://" not in remote and ":" in remote
+            and "/" not in remote.split(":", 1)[0])
+
+
 def _cmd(*args: str, cwd: Path | None = None) -> str:
-    """Run one bounded read-only Git/systemd probe, raising on any failure."""
+    """Run one bounded read-only Git/systemd probe without hostile Git paths."""
     proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True,
-                          timeout=20, check=True)
+                          timeout=20, check=True, env=_safe_git_env())
     return proc.stdout.strip()
 
 
@@ -40,7 +115,7 @@ def _health_url() -> str:
     """Resolve a single explicit or local endpoint without following a proxy."""
     configured = os.environ.get("ROMARR_UPDATE_HEALTH_URL", "")
     if not configured:
-        host = os.environ.get("ROMARR_HOST", "0.0.0.0")
+        host = os.environ.get("ROMARR_HOST") or "0.0.0.0"
         if host not in ("0.0.0.0", "127.0.0.1", "localhost", "::", "::1"):
             host = host.strip("[]")
         if not re.fullmatch(r"[A-Za-z0-9.:-]+", host):
@@ -97,12 +172,15 @@ def _confined_layout(repo: Path, gitdir: Path, python: str) -> Path:
     return interpreter
 
 
-def preflight(env, target: str) -> dict:
+def preflight(env, target: str, *, expected_revision: str = "", expected_base: str = "") -> dict:
     """Verify exact Git root, branch, origin, clean worktree and service before launch."""
     if env.kind != "git" or not env.repo:
         raise ValueError("only an identified Git/source install can self-update")
     if not SAFE_REF.fullmatch(target):
         raise ValueError("invalid or unsupported update target")
+    pull_preview = target.startswith("refs/pull/")
+    if pull_preview and (not re.fullmatch(r"[0-9a-f]{40}", expected_revision) or not re.fullmatch(r"[0-9a-f]{40}", expected_base)):
+        raise ValueError("PR previews require exact head and base revisions")
     if not SAFE_SERVICE.fullmatch(env.service) or env.service in (".", ".."):
         raise ValueError("invalid service unit name")
     if not env.branch or env.branch == "HEAD":
@@ -132,6 +210,10 @@ def preflight(env, target: str) -> dict:
     if _cmd(git, "status", "--porcelain", "--untracked-files=all", cwd=repo):
         raise ValueError("working tree contains tracked or untracked changes")
     remote = _cmd(git, "remote", "get-url", "origin", cwd=repo)
+    if _is_ssh_remote(remote):
+        # ProtectHome=yes can hide the agent, keys and known_hosts expected
+        # by URL and SCP-style SSH origins. Refuse before reservation.
+        raise ValueError("SSH Git remote is unsupported by the confined updater; use an explicitly trusted HTTPS origin")
     configured = os.environ.get("ROMARR_UPDATE_REMOTE_URL", "").strip()
     if (remote != configured if configured else remote not in OFFICIAL_REMOTES):
         raise ValueError("origin URL not explicitly trusted for updates")
@@ -145,10 +227,26 @@ def preflight(env, target: str) -> dict:
     if _cmd("systemctl", "is-active", service) != "active":
         raise ValueError("expected systemd service is not active")
     health = _health_url()
-    return {"repo": repo, "gitdir": gitdir, "branch": env.branch,
-            "commit": full, "remote": remote, "service": service,
-            "python": str(interpreter),
-            "target": target, "health_url": health}
+    result = {"repo": repo, "gitdir": gitdir, "branch": env.branch,
+              "commit": full, "remote": remote, "service": service,
+              "python": str(interpreter), "target": target, "health_url": health}
+    if pull_preview:
+        result.update(expected_revision=expected_revision, expected_base=expected_base)
+    if target.startswith("refs/romarr/rollback/"):
+        ident = target.rsplit("/", 1)[-1]
+        metadata = gitdir / "romarr-preview-backups" / (ident + ".json")
+        if metadata.is_symlink() or not metadata.is_file() or metadata.stat().st_size > 65536:
+            raise ValueError("Preview rollback record is missing or unsafe")
+        record = json.loads(metadata.read_text())
+        if not isinstance(record, dict):
+            raise ValueError("Invalid preview rollback record")
+        if record.get("backup_id") != ident or record.get("head") != full or record.get("branch") != env.branch:
+            raise ValueError("Checkout changed after the preview; rollback refused")
+        previous = record.get("previous_commit", "")
+        if not isinstance(previous, str) or not re.fullmatch(r"[0-9a-f]{40}", previous) or _cmd(git, "rev-parse", "--verify", target + "^{commit}", cwd=repo) != previous:
+            raise ValueError("Rollback target changed")
+        result.update(rollback=True, expected_revision=previous)
+    return result
 
 
 def build_script(state: dict, run_id: str, log_path: Path, lock: Path) -> str:
@@ -164,6 +262,28 @@ def build_script(state: dict, run_id: str, log_path: Path, lock: Path) -> str:
         'headers={"Cache-Control":"no-cache"}),timeout=4); '
         'sys.exit(0 if r.status==200 and json.load(r).get("ok") is True else 1)'
     )
+    fetch = "git fetch --tags origin"
+    resolve = 'POST=$(git rev-parse --verify "$TARGET^{commit}")'
+    if state.get("expected_base"):
+        fetch = ("git fetch --no-tags origin refs/heads/main && "
+                 + "test \"$(git rev-parse FETCH_HEAD)\" = " + q(state["expected_base"])
+                 + " && git fetch --no-tags origin \"$TARGET\"")
+        resolve = 'POST=$(git rev-parse --verify "FETCH_HEAD^{commit}")'
+    elif state.get("rollback"):
+        fetch = ":"
+    expected = state.get("expected_revision", "")
+    collision_check = (
+        "import os,subprocess,sys;from pathlib import Path;"
+        "old=set(subprocess.check_output(['git','ls-files','-z']).split(bytes([0])));"
+        "new=subprocess.check_output(['git','ls-tree','-r','--name-only','-z',sys.argv[1]]).split(bytes([0]));"
+        "sys.exit(1 if any(p and p not in old and os.path.lexists(os.fsdecode(p)) for p in new) else 0)"
+    )
+    move = ('git merge --ff-only --no-overwrite-ignore "$POST"' if not state.get("rollback") else
+            py + ' -c ' + q(collision_check) + ' "$POST" && '
+            'git checkout --detach --no-overwrite-ignore "$POST" && '
+            'git update-ref "refs/heads/$BRANCH" "$POST" "$PRE" && '
+            'git symbolic-ref HEAD "refs/heads/$BRANCH"')
+    ancestry = 'git merge-base --is-ancestor "$PRE" "$POST"' if not state.get("rollback") else ":"
     script = f'''#!/bin/sh
 set -eu
 exec >>{q(log_path)} 2>&1
@@ -177,6 +297,8 @@ SERVICE={q(state["service"])}
 HEALTH={q(state["health_url"])}
 GITDIR={q(state["gitdir"])}
 cd {q(state["repo"])}
+# Do not inherit caller-selected Git object/index/worktree locations.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR
 echo "START: $RUN; target=$TARGET; service=$SERVICE"
 # A worker can only unlock its own claim after a verified successful result.
 finish_success() {{
@@ -214,23 +336,26 @@ if ! valid_state || test "$(git rev-parse HEAD)" != "$PRE"; then
   echo 'ERROR: source identity, branch or worktree changed; RECOVERY REQUIRED'
   exit 1
 fi
-if ! git fetch --tags origin; then
+if ! ( {fetch} ); then
   echo 'ERROR: fetch failed; checkout unchanged; RECOVERY REQUIRED'
   exit 1
 fi
 # Do not trust names or a moving ref after fetch; resolve one exact object.
-POST=$(git rev-parse --verify "$TARGET^{{commit}}") || {{
+{resolve} || {{
   echo 'ERROR: target ref cannot be resolved; RECOVERY REQUIRED'; exit 1;
 }}
+if test -n {q(expected)} && test "$POST" != {q(expected)}; then
+  echo 'ERROR: pinned preview revision changed; RECOVERY REQUIRED'; exit 1
+fi
 if ! valid_state || test "$(git rev-parse HEAD)" != "$PRE"; then
   echo 'ERROR: checkout changed during fetch; RECOVERY REQUIRED'
   exit 1
 fi
-if ! git merge-base --is-ancestor "$PRE" "$POST"; then
+if ! ( {ancestry} ); then
   echo 'ERROR: target is not a fast-forward descendant; RECOVERY REQUIRED'
   exit 1
 fi
-if ! git merge --ff-only "$POST"; then
+if ! ( {move} ); then
   echo 'ERROR: fast-forward refused; RECOVERY REQUIRED'
   exit 1
 fi
@@ -242,7 +367,10 @@ echo "UPDATED: pre=$PRE post=$POST"
 if test -f requirements.txt; then
   if ! {py} -m pip install -q -r requirements.txt; then
     echo 'ERROR: dependencies failed; attempting guarded code-only rollback'
-    if valid_state && test "$(git rev-parse HEAD)" = "$POST" && git reset --keep "$PRE"; then
+    if valid_state && test "$(git rev-parse HEAD)" = "$POST" &&
+       git checkout --detach --no-overwrite-ignore "$PRE" &&
+       git update-ref "refs/heads/$BRANCH" "$PRE" "$POST" &&
+       git symbolic-ref HEAD "refs/heads/$BRANCH"; then
       echo 'STATUS: CODE ROLLED BACK; pip environment may have changed; RECOVERY REQUIRED'
     else
       echo 'STATUS: ROLLBACK BLOCKED; preserve checkout and inspect; RECOVERY REQUIRED'
@@ -252,6 +380,14 @@ if test -f requirements.txt; then
 fi
 if ! valid_state || test "$(git rev-parse HEAD)" != "$POST"; then
   echo 'ERROR: checkout modified during dependencies; RECOVERY REQUIRED'
+  exit 1
+fi
+if ! {py} -c {q(_BUILD_STAMP)} "$TARGET" "$POST"; then
+  echo 'ERROR: generated identity publication failed; RECOVERY REQUIRED'
+  exit 1
+fi
+if ! valid_state || test "$(git rev-parse HEAD)" != "$POST"; then
+  echo 'ERROR: checkout changed during identity publication; RECOVERY REQUIRED'
   exit 1
 fi
 if ! systemctl restart "$SERVICE"; then
@@ -271,10 +407,11 @@ finish_success
     return script
 
 
-def launch(env, target: str) -> dict:
+def launch(env, target: str, *, expected_revision: str = "", expected_base: str = "", prepare=None) -> dict:
     """Claim a single-flight update and launch an independent transient worker."""
+    options = {"expected_revision": expected_revision, "expected_base": expected_base} if expected_revision or expected_base else {}
     try:
-        state = preflight(env, target)
+        state = preflight(env, target, **options)
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         return {"ok": False, "error": f"update preflight blocked: {exc}"}
     lock = state["gitdir"] / LOCK_NAME
@@ -290,9 +427,12 @@ def launch(env, target: str) -> dict:
     attempted = False
     try:
         # Recheck Git identity after atomic acquisition, prior to scheduling.
-        second = preflight(env, target)
+        second = preflight(env, target, **options)
         if second != state:
             raise ValueError("source or service identity changed during reservation")
+        if prepare is not None:
+            # Preview backups and provenance must share the worker's atomic ownership.
+            prepare(state)
         (lock / "run_id").write_text(run_id, encoding="ascii")
         log_path = state["gitdir"] / LOG_NAME
         script = lock / "run.sh"
@@ -309,7 +449,8 @@ def launch(env, target: str) -> dict:
              "--property=ProtectHome=yes",
              f"--property=ReadWritePaths={state['repo']}",
              "/bin/sh", str(script)],
-            capture_output=True, text=True, timeout=30, check=False)
+            capture_output=True, text=True, timeout=30, check=False,
+            env=_safe_git_env())
         if proc.returncode:
             raise RuntimeError("systemd-run rejected the independent worker")
         started = True

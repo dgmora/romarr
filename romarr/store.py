@@ -30,7 +30,37 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .platforms import by_slug
+
 log = logging.getLogger(__name__)
+
+
+def validate_dat_catalog_platforms(value: Any) -> dict[str, str]:
+    """Validate explicit DAT display-name to canonical ROMarr platform bindings.
+
+    Never infer platforms from a DAT title. Case-equivalent catalog duplicates,
+    malformed names and aliases cannot become a trusted request mapping.
+    """
+    if not isinstance(value, dict) or len(value) > 256:
+        raise ValueError("DAT catalog mappings must be an object with at most 256 entries")
+    out: dict[str, str] = {}
+    seen: set[str] = set()
+    for catalog, slug in value.items():
+        if (not isinstance(catalog, str) or not catalog.strip()
+                or catalog != catalog.strip() or len(catalog) > 256
+                or any(ord(char) < 32 for char in catalog)):
+            raise ValueError("DAT catalog name is empty, malformed, or too long")
+        folded = catalog.casefold()
+        if folded in seen:
+            raise ValueError("Duplicate DAT catalog name; use one mapping per catalog")
+        if not isinstance(slug, str) or not slug or len(slug) > 80:
+            raise ValueError("DAT mapping must use a canonical platform slug")
+        platform = by_slug(slug)
+        if platform is None or platform.slug != slug:
+            raise ValueError("DAT mapping must use an existing canonical platform slug")
+        seen.add(folded)
+        out[catalog] = slug
+    return out
 
 
 class StateUnreadable(RuntimeError):
@@ -90,6 +120,7 @@ class WantedItem:
     # `attempts` it drives the re-search backoff, so a title that has failed
     # for months is retried weekly rather than hourly.
     searched_at: str = ""
+    monitored: bool = True
 
 
 @dataclass
@@ -204,11 +235,18 @@ class SeerrRequest:
 # Defaults are spelled out here rather than scattered through the UI so a fresh
 # install and a configured one disagree about nothing.
 DEFAULT_SETTINGS: dict[str, Any] = {
+    "soundtrack_sources": "zophar,archive",
+    "music_library_root": "",
     # How a friend's server reaches this one, e.g. https://romarr.example.com.
     # Peering is the only feature that needs ROMarr to know its own address:
     # an invitation carries it, and without one the friend who redeems the
     # invitation has nowhere to call back to.
     "public_url": "",
+    # Optional host-side FlareSolverr base URL (e.g. http://localhost:8191)
+    # used by ROM Hub's broker/downloader when an allowed HTTPS source answers
+    # with a Cloudflare challenge. Never passed to untrusted plugin code.
+    "flaresolverr_url": "",
+    "romm_public_url": "",
     # --- OpenID Connect sign-in (Authentik or any OIDC IdP) ---
     # Off until an issuer + client id exist. Distinct from forward-auth SSO
     # (sso.py), which believes a reverse proxy's headers; this makes ROMarr
@@ -248,6 +286,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # reload_dats when saved from the UI, so the setting acts rather than
     # just sits.
     "dat_path": "",
+    # Explicit, optional DAT header-name -> canonical platform slug associations.
+    # No automatic request-aware import reads these mappings yet (Part 2).
+    "dat_catalog_platforms": {},
     # Directory shape ROMs are filed in, matching the library server's own
     # setting. "flat" is <root>/<platform>/<rom> (RomM "Structure A"); "nested"
     # is <root>/<platform>/roms/<rom> (RomM "Structure B"). Overridable per
@@ -265,11 +306,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # historical English-only behaviour; operators select their own codes
     # under Settings -> Media Management.
     "translation_langs": ["en"],
+    # Ordered preferred game languages for language-aware 1G1R filtering
+    # (e.g. ["fr", "en"]). Empty preserves region-only 1G1R behaviour.
+    "preferred_languages": [],
     # "prefer" keeps a title even when no dump matches the region list (the
     # historical fallback); "strict" treats the list as an allowlist.
     "region_mode": "prefer",
     "rename_on_import": True,
     "prefer_hardlinks": False,
+    "switch_attach_extras": True,   # file Switch updates/DLC in <game>/update|dlc
     "retain_downloads_after_import": True,
     "overwrite_existing": False,
     # Profile: for ROMs the meaningful axis is region and revision, not
@@ -288,6 +333,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "preferred_terms": [],
     "excluded_terms": [],
     "required_terms": [],
+    "ignored_dlc": [],
+    "video_standard": "",
+    "video_standard_strict": False,
+    "preferred_formats": {},
     "platform_profiles": {},         # slug -> {min_size_mb, max_size_mb, ...}
     "protocol": "torrent",       # torrent | usenet
     # Remote path mappings, the same concept Radarr and Sonarr expose.
@@ -487,7 +536,7 @@ class Store:
 
     # -- wanted ------------------------------------------------------------
 
-    def want(self, game: str, platform: str) -> WantedItem:
+    def want(self, game: str, platform: str, monitored: bool = True) -> WantedItem:
         """Add to Wanted, or return the existing entry.
 
         Requesting the same game twice is a retry, not a second entry.
@@ -496,10 +545,22 @@ class Store:
             for item in self.wanted:
                 if item.game.lower() == game.lower() and item.platform == platform:
                     return item
-            item = WantedItem(game=game, platform=platform)
+            item = WantedItem(game=game, platform=platform, monitored=monitored)
             self.wanted.append(item)
         self.save()
         return item
+
+    def set_monitored(self, game: str, platform: str, monitored: bool) -> bool:
+        """Turn watching on or off for one Wanted entry; False if it is not there."""
+        with self._lock:
+            for item in self.wanted:
+                if item.game.lower() == game.lower() and item.platform == platform:
+                    item.monitored = bool(monitored)
+                    break
+            else:
+                return False
+        self.save()
+        return True
 
     def fulfil(self, game: str, platform: str) -> bool:
         """Drop something from Wanted once it has actually arrived."""
@@ -731,10 +792,33 @@ class Store:
         Unknown keys are dropped rather than stored: a typo in a PUT should not
         silently become permanent state that nothing ever reads.
         """
+        # Validate before changing any settings: a rejected mapping must not
+        # commit unrelated fields from the same API request.
+        mapping = (validate_dat_catalog_platforms(patch["dat_catalog_platforms"])
+                   if "dat_catalog_platforms" in patch else None)
+        if "flaresolverr_url" in patch:
+            from urllib.parse import urlsplit
+            raw_solver = str(patch["flaresolverr_url"] or "").strip().rstrip("/")
+            if raw_solver:
+                parts = urlsplit(raw_solver)
+                if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+                    raise ValueError("FlareSolverr URL must start with http:// or https://")
+            patch = dict(patch, flaresolverr_url=raw_solver)
         with self._lock:
+            # No catalog provenance can be trusted without a selected DAT root.
+            # Refuse the whole patch before changing memory or the saved file.
+            if (mapping and not str(
+                    patch.get("dat_path", self.settings.get("dat_path")) or ""
+            ).strip()):
+                raise ValueError("Select a DAT directory before saving catalog mappings")
+            if ("dat_path" in patch
+                    and str(patch["dat_path"] or "") != str(self.settings.get("dat_path") or "")
+                    and (mapping if mapping is not None
+                         else self.settings.get("dat_catalog_platforms") or {})):
+                raise ValueError("Clear DAT catalog mappings before changing the DAT directory")
             for key, value in patch.items():
                 if key in DEFAULT_SETTINGS:
-                    self.settings[key] = value
+                    self.settings[key] = mapping if key == "dat_catalog_platforms" else value
             out = dict(self.settings)
         self.save()
         return out

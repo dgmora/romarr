@@ -127,7 +127,7 @@ def test_search_renderer_disc_labels_and_grab_request():
     node = shutil.which('node')
     if not node:
         pytest.skip('node required for search renderer')
-    source = page().split('RENDER.search=', 1)[1].split('RENDER.missing=', 1)[0]
+    source = page().split('RENDER.search=', 1)[1].split('RENDER.game=', 1)[0]
     script = r'''
 const assert=require('node:assert/strict');
 const nodes={};

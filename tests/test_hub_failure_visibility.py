@@ -278,12 +278,13 @@ def test_search_again_preserves_link_and_replacement_updates(tmp_path, monkeypat
     file.write_bytes(b"rom")
     c._fetch = lambda *a: {"ok": True, "files": [str(file)]}
     from types import SimpleNamespace
+    from romarr.library import ImportResult
     monkeypatch.setattr(s, "library_for", lambda _: ({}, SimpleNamespace(rescan=lambda _: None)))
     monkeypatch.setattr(s, "library_root", lambda _: tmp_path)
     monkeypatch.setattr(s, "library_layout", lambda _: "flat")
     monkeypatch.setattr(s, "platform_folders", lambda _: {})
     monkeypatch.setattr("romarr.app.import_rom", lambda *a, **kw:
-                        [SimpleNamespace(ok=True, destination=file, verification="unchecked", import_method="copy", fallback_reason="")])
+                        [ImportResult(ok=True, destination=file, import_method="copy")])
     s.store.settings["reconcile_after_import"] = False
     s.import_finished()
     assert s.store.get_seerr_request("req").status == "available"

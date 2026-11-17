@@ -40,7 +40,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import unquote, urlsplit
 from urllib.robotparser import RobotFileParser
 
@@ -562,6 +562,7 @@ class Transmission:
     request for nothing.
     """
 
+    supports_torrent_file = True
     protocol = "torrent"
     name = "Transmission"
     RPC_PATH = "/transmission/rpc"
@@ -574,6 +575,7 @@ class Transmission:
         self._added = threading.local()
         self._rpc_version = None
         self._rpc_version_lock = threading.Lock()
+        self._selection_lock = threading.RLock()
 
     @property
     def last_job_id(self):
@@ -634,69 +636,113 @@ class Transmission:
             log.warning("%s unreachable: %s", self.name, exc)
             return False
 
-    def add(self, magnet_or_url: str, *, save_path: str | None = None) -> bool:
-        return self._add({"filename": magnet_or_url}, save_path=save_path)
+    def add(self, magnet_or_url: str, *, save_path: str | None = None,
+            category: str | None = None) -> bool:
+        """Add a torrent, or attach an unowned magnet without moving its files."""
+        return self._add({"filename": magnet_or_url}, save_path=save_path, category=category)
 
-    def add_torrent_file(self, torrent: bytes, *, save_path: str | None = None) -> bool:
+    def add_torrent_file(self, torrent: bytes, *, save_path: str | None = None,
+                         category: str | None = None) -> bool:
+        """Upload locally resolved metainfo without sharing the indexer URL."""
         return self._add({"metainfo": base64.b64encode(torrent).decode("ascii")},
-                         save_path=save_path)
+                         save_path=save_path, category=category)
 
-    def _add(self, arguments: dict, *, save_path: str | None = None) -> bool:
+    def _add(self, arguments: dict, *, save_path=None, category=None) -> bool:
+        """Serialize attachment with other submissions through this client."""
+        with self._selection_lock:
+            return self._add_locked(arguments, save_path=save_path, category=category)
+
+    def _add_locked(self, arguments: dict, *, save_path=None, category=None) -> bool:
+        """Submit once, verifying legacy labels and duplicate attachment."""
         self.last_job_id = ""
+        category = self._config.category if category is None else category
         destination = save_path or self._config.save_path
         if destination:
             arguments["download-dir"] = destination
         try:
-            version = self._get_rpc_version() if self._config.category else None
+            version = self._get_rpc_version() if category else None
             if version is not None:
                 if version < 16:
                     raise RuntimeError("configured labels require Transmission RPC 16 or later")
                 if version >= 17:
-                    arguments["labels"] = [self._config.category]
+                    arguments["labels"] = [category]
             body = self._call("torrent-add", arguments)
-        except Exception as exc:
-            log.warning("%s add failed: %s", self.name, exc)
-            return False
-        if body.get("result") != "success":
-            log.warning("Transmission refused the torrent: %s", body.get("result"))
-            return False
-        added = body.get("arguments", {})
-        job = added.get("torrent-added") or added.get("torrent-duplicate") or {}
-        identity = str(job.get("hashString") or "").lower()
-        if not identity:
-            log.warning("Transmission did not return a torrent identity")
-            return False
-        duplicate = bool(added.get("torrent-duplicate"))
-        label_after_add = version == 16 and not duplicate
-        if duplicate or label_after_add:
-            try:
-                if label_after_add:
-                    result = self._call("torrent-set", {
-                        "ids": [identity], "labels": [self._config.category]})
-                    if result.get("result") != "success":
-                        raise RuntimeError("could not apply the configured torrent label")
-                existing = self._call("torrent-get", {"ids": [identity],
-                    "fields": ["hashString", "labels", "downloadDir"]})
-                rows = (existing.get("arguments") or {}).get("torrents") or []
-                owned = (existing.get("result") == "success" and len(rows) == 1
-                         and str(rows[0].get("hashString") or "").lower() == identity
-                         and bool(self._config.category)
-                         and self._config.category in (rows[0].get("labels") or [])
-                         and bool(rows[0].get("downloadDir"))
-                         and (not duplicate or bool(destination))
-                         and (not destination or str(rows[0]["downloadDir"]).rstrip("/")
-                              == str(destination).rstrip("/")))
-                if not owned:
-                    raise RuntimeError("torrent hash, label or download directory does not match ROMarr")
-            except Exception as exc:
-                log.warning("%s ownership verification failed; torrent left intact: %s", self.name, exc)
+            if body.get("result") != "success":
                 return False
-        self.last_job_id = identity
-        return True
+            added = body.get("arguments", {})
+            job = added.get("torrent-added") or added.get("torrent-duplicate") or {}
+            identity = str(job.get("hashString") or "").lower()
+            if not identity:
+                return False
+            if added.get("torrent-duplicate"):
+                if not self._adopt_duplicate(arguments.get("filename", ""), identity, category):
+                    return False
+            elif version == 16:
+                result = self._call("torrent-set", {"ids": [identity], "labels": [category]})
+                if result.get("result") != "success":
+                    raise RuntimeError("could not apply the configured torrent label")
+                rows = self._torrent_identity(identity)
+                if (result.get("result") != "success" or len(rows) != 1
+                        or category not in (rows[0].get("labels") or [])
+                        or not rows[0].get("downloadDir")
+                        or (destination and str(rows[0]["downloadDir"]).rstrip("/") != str(destination).rstrip("/"))):
+                    raise RuntimeError("torrent hash, label or download directory does not match ROMarr")
+            self.last_job_id = identity
+            return True
+        except Exception as exc:
+            log.warning("%s add failed; torrent left intact: %s", self.name, type(exc).__name__)
+            return False
 
-    def torrents(self) -> list[dict]:
+    def _torrent_identity(self, identity):
+        """Inspect exactly one returned hash without trusting a display name."""
+        body = self._call("torrent-get", {"ids": [identity],
+                          "fields": ["hashString", "labels", "downloadDir"]})
+        rows = (body.get("arguments") or {}).get("torrents") or []
+        if (body.get("result") != "success" or len(rows) != 1
+                or str(rows[0].get("hashString") or "").lower() != identity):
+            return []
+        return rows
+
+    def _adopt_duplicate(self, magnet, identity, category):
+        """Claim an unowned magnet, preserving its directory and unrelated labels."""
+        from .retained_collection import magnet_hash
+
+        if not category or not str(magnet).startswith("magnet:") or magnet_hash(magnet) != identity:
+            return False
+        rows = self._torrent_identity(identity)
+        if not rows or not self._safe_download_directory(rows[0].get("downloadDir")):
+            return False
+        original = rows[0]
+        labels = original.get("labels") or []
+        if (not isinstance(labels, list) or any(not isinstance(label, str) for label in labels)
+                or any(label in (category, self._config.category) or label.startswith("romarr-") for label in labels)):
+            return False
+        try:
+            result = self._call("torrent-set", {"ids": [identity], "labels": labels + [category]})
+            verified = self._torrent_identity(identity)
+            if (result.get("result") == "success" and verified
+                    and set(verified[0].get("labels") or []) == set(labels + [category])
+                    and verified[0].get("downloadDir") == original["downloadDir"]):
+                return True
+        except Exception:
+            pass
+        try:
+            current = self._torrent_identity(identity)
+            if current:
+                restored = [label for label in current[0].get("labels", []) if label != category]
+                result = self._call("torrent-set", {"ids": [identity], "labels": restored})
+                if result.get("result") != "success":
+                    log.warning("%s duplicate label rollback failed", self.name)
+        except Exception:
+            log.warning("%s duplicate label rollback failed", self.name)
+        return False
+
+    def torrents(self, *, category: str | None = None) -> list[dict]:
+        """Read torrent state and safe payload paths for the selected category."""
+        category = self._config.category if category is None else category
         body = self._call("torrent-get", {"fields": ["hashString", "name", "downloadDir",
-                          "labels", "status", "totalSize", "pieceSize", "percentDone"]})
+                          "labels", "status", "totalSize", "pieceSize", "percentDone",
+                          "files", "metadataPercentComplete", "leftUntilDone"]})
         if body.get("result") != "success":
             raise RuntimeError("Transmission could not list torrents")
         states = {0: "pausedDL", 1: "queuedDL", 2: "checkingDL", 3: "queuedDL",
@@ -706,7 +752,8 @@ class Transmission:
                  "state": states.get(row.get("status"), "unknown"),
                  "size": row.get("totalSize", 0), "piece_size": row.get("pieceSize", 0),
                  "progress": row.get("percentDone", 0),
-                 "category": self._config.category if self._config.category in row.get("labels", []) else ""}
+                 "content_path": self._content_path(row),
+                 "category": category if category in row.get("labels", []) else ""}
                 for row in body.get("arguments", {}).get("torrents", [])]
 
     def pause_torrent(self, torrent_hash: str) -> bool:
@@ -769,6 +816,38 @@ class Transmission:
                     args[key] = indexes
         return self._call("torrent-set", args).get("result") == "success"
 
+    @staticmethod
+    def _safe_download_directory(directory):
+        """Accept absolute remote paths without traversal or null characters."""
+        if not isinstance(directory, str) or not directory or chr(0) in directory:
+            return False
+        parts = directory.replace("\\", "/").split("/")
+        return (".." not in parts and (PurePosixPath(directory).is_absolute()
+                or PureWindowsPath(directory).is_absolute()))
+
+    @staticmethod
+    def _content_path(torrent):
+        """Resolve a complete torrent's payload without returning a shared root."""
+        directory = torrent.get("downloadDir")
+        if (not Transmission._safe_download_directory(directory) or torrent.get("metadataPercentComplete") != 1
+                or torrent.get("percentDone") != 1 or torrent.get("leftUntilDone", 1) != 0
+                or torrent.get("totalSize", 0) <= 0):
+            return ""
+        files = [str(entry.get("name") or "").replace("\\", "/").split("/")
+                 for entry in torrent.get("files") or []]
+        if not files or any(part in ("", ".", "..") or ":" in part or chr(0) in part
+                            for path in files for part in path):
+            return ""
+        if len(files) == 1:
+            relative = "/".join(files[0])
+        else:
+            root = files[0][0]
+            if not all(len(path) > 1 and path[0] == root for path in files):
+                # Never point the importer at a shared downloads folder.
+                return ""
+            relative = root
+        return directory.rstrip("/\\") + "/" + relative
+
     def completed(self, timeout: float | None = None) -> list[dict]:
         """Finished Transmission downloads carrying our category, bounded by `timeout`."""
         if not self.configured:
@@ -790,35 +869,55 @@ class Transmission:
                     or torrent.get("totalSize", 0) <= 0):
                 continue
             labels = torrent.get("labels") or []
-            if category and category not in labels:
+            if (category and category not in labels) or "romarr-soundtracks" in labels:
                 continue
             directory = torrent.get("downloadDir")
-            if (not directory or (self._config.save_path
-                    and directory.rstrip("/\\") != self._config.save_path.rstrip("/\\"))):
+            if not directory:
                 continue
-            files = [str(entry.get("name") or "").replace("\\", "/").split("/")
-                     for entry in torrent.get("files") or []]
-            if not files or any(part in ("", ".", "..") or ":" in part or chr(0) in part
-                                for path in files for part in path):
+            content_path = self._content_path(torrent)
+            if not content_path:
                 continue
-            if len(files) == 1:
-                relative = "/".join(files[0])
-            else:
-                root = files[0][0]
-                if not all(len(path) > 1 and path[0] == root for path in files):
-                    # Never point the importer at a shared downloads folder.
-                    continue
-                relative = root
             info_hash = str(torrent.get("hashString") or "").lower()
             if not info_hash:
                 continue
             completed.append({
                 "id": info_hash, "hash": info_hash, "name": torrent.get("name") or "",
                 "save_path": directory,
-                "content_path": directory.rstrip("/\\") + "/" + relative,
+                "content_path": content_path,
                 "category": category if category in labels else "",
             })
         return completed
+
+    def progress(self, *, deadline: float | None = None) -> dict[str, dict]:
+        """Read category-scoped progress within the queue's shared deadline."""
+        import math
+
+        if deadline is None:
+            deadline = time.monotonic() + 2
+        body = self._call("torrent-get", {"fields": ["hashString", "labels", "percentDone",
+                          "eta", "rateDownload", "status"]}, _deadline=deadline)
+        if body.get("result") != "success":
+            return {}
+        states = {0: "pausedDL", 1: "queuedDL", 2: "checkingDL", 3: "queuedDL",
+                  4: "downloading", 5: "queuedUP", 6: "uploading"}
+        out = {}
+        for row in ((body.get("arguments") or {}).get("torrents") or [])[:10000]:
+            if not isinstance(row, dict) or (self._config.category and self._config.category not in (row.get("labels") or [])):
+                continue
+            identity = str(row.get("hashString") or "").lower()
+            if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", identity):
+                continue
+            try:
+                percent, eta, speed = (float(row.get(key, default)) for key, default in
+                                       (("percentDone", 0), ("eta", -1), ("rateDownload", 0)))
+                if not all(math.isfinite(value) for value in (percent, eta, speed)):
+                    continue
+            except (ValueError, TypeError, OverflowError):
+                continue
+            out[identity] = {"progress": round(max(0, min(1, percent)) * 100, 1),
+                             "eta": int(eta) if 0 <= eta < 8640000 else None,
+                             "speed": max(0, int(speed)), "dl_state": states.get(row.get("status"), "unknown")}
+        return out
 
 class Vuze(Transmission):
     """Vuze, which is Transmission's RPC wearing a different badge.
@@ -2392,6 +2491,7 @@ class RealDebrid(DebridClient):
     """
 
     name = "Real-Debrid"
+    magnet_only = True
 
     LEDGER = ".romarr-realdebrid.json"
     DEFAULT_URL = "https://api.real-debrid.com/rest/1.0"

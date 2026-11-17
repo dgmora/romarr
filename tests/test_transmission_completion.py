@@ -19,15 +19,15 @@ def test_configured_directory_and_identity():
     assert c._call.call_args.args[1]["download-dir"] == "/downloads/romarr"
     assert build_client({"type":"transmission", "host":"localhost", "port":9091, "save_path":"/downloads/romarr"})._config.save_path == "/downloads/romarr"
 
-@pytest.mark.parametrize("changes", [{"labels":[]}, {"downloadDir":"/downloads/tv"}, {"hashString":"b"*40}])
+@pytest.mark.parametrize("changes", [{}, {"labels":["romarr-collection-existing"]}, {"hashString":"b"*40}, {"downloadDir":""}])
 def test_foreign_duplicates_are_rejected_without_modification(changes):
     c = client()
     c._call = Mock(side_effect=[{"result":"success", "arguments":{"torrent-duplicate":{"hashString":HASH}}}, {"result":"success", "arguments":{"torrents":[torrent(**changes)]}}])
-    assert not c.add("magnet:demo")
+    assert not c.add("magnet:?xt=urn:btih:" + HASH)
     assert c.last_job_id == ""
     assert [call.args[0] for call in c._call.call_args_list] == ["torrent-add", "torrent-get"]
 
-@pytest.mark.parametrize("changes", [{"leftUntilDone":1}, {"percentDone":0.9}, {"totalSize":0}, {"labels":[]}, {"downloadDir":"/downloads/tv"}])
+@pytest.mark.parametrize("changes", [{"leftUntilDone":1}, {"percentDone":0.9}, {"totalSize":0}, {"labels":[]}])
 def test_polling_filters_incomplete_and_foreign_downloads(changes):
     c = client()
     c._call = Mock(return_value={"result":"success", "arguments":{"torrents":[torrent(**changes), torrent()]}})
@@ -228,15 +228,14 @@ def test_failed_discovery_is_retried():
 
 
 @pytest.mark.parametrize('version', [16, 17])
-@pytest.mark.parametrize('changes,accepted', [({}, True), ({'labels': []}, False),
-    ({'downloadDir': '/other'}, False), ({'hashString': 'b' * 40}, False)])
-def test_version_aware_duplicates_are_only_inspected(version, changes, accepted):
+def test_duplicate_owned_by_romarr_is_only_inspected(version):
+    """A second request cannot claim an already owned torrent."""
     c = client()
     c._rpc_version = version
     c._call = Mock(side_effect=[success(**{'torrent-duplicate': {'hashString': HASH}}),
-                               success(torrents=[torrent(**changes)])])
-    assert c.add('magnet:demo') is accepted
-    assert c.last_job_id == (HASH if accepted else '')
+                               success(torrents=[torrent()])])
+    assert not c.add('magnet:?xt=urn:btih:' + HASH)
+    assert not c.last_job_id
     assert [call.args[0] for call in c._call.call_args_list] == ['torrent-add', 'torrent-get']
 
 

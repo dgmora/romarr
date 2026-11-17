@@ -363,6 +363,7 @@ def test_issue_118_hub_search_filters_collection_paths(monkeypatch, authenticate
     monkeypatch.setitem(sys.modules, "rom_hub.broker.fetcher", fake_fetcher_mod)
     monkeypatch.setitem(sys.modules, "rom_hub.dispatcher", fake_disp)
 
+    monkeypatch.setenv("ROMARR_ALLOW_UNSANDBOXED_PLUGINS", "1")
     rows, err = hub.search("game", platform="ps2", limit=1)
     assert err == ""
     assert len(rows) == 2

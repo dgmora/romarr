@@ -9,7 +9,7 @@ Python, ROM Hub, MinGit, .NET and a fixed WebView2 runtime ship in the package.
 [CmdletBinding()]
 param(
     [string]$OutputDirectory,
-    [string]$Version = '1.9.0',
+    [string]$Version = '1.10.2',
     [string]$PythonPath = 'python',
     [string]$StoreIdentityName = 'MoveWeight.ROMarr.Desktop',
     [string]$StorePublisher = 'CN=MoveWeight',
@@ -19,13 +19,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'desktop-version.ps1')
+$packageVersion = Get-ROMarrDesktopPackageVersion -Version $Version
 if (-not $IsWindows) { throw 'Build the desktop package on Windows with .NET 10 SDK and Python 3.13.' }
 $repo = Split-Path -Parent $PSScriptRoot
 if (-not $OutputDirectory) { $OutputDirectory = Join-Path $repo 'artifacts\windows' }
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 [IO.Directory]::CreateDirectory($OutputDirectory) | Out-Null
-if ($Version -notmatch '^\d+\.\d+\.\d+(?:\.\d+)?$') { throw 'Version must contain three or four numeric components.' }
-if (-not $StoreVersion) { $StoreVersion = if ($Version.Split('.').Count -eq 3) { "$Version.0" } else { $Version } }
+if (-not $StoreVersion) { $StoreVersion = $packageVersion.StoreVersion }
 if ($StoreVersion -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw 'StoreVersion must have four numeric components.' }
 if ($StoreIdentityName -notmatch '^[A-Za-z0-9.-]+$') { throw 'StoreIdentityName must be the package identity from Partner Center.' }
 
@@ -46,8 +47,8 @@ foreach ($directory in @($backend, $site, $backendApp)) {
 $pythonVersion = '3.13.17'
 $pythonUrl = "https://www.python.org/ftp/python/$pythonVersion/python-$pythonVersion-embed-amd64.zip"
 $pythonSha = '9e35319bffedab8b36ad44d8f377cb4f1733bcec257a0b6d04d94f01486ddb38'
-$hubCommit = '02e9a1dbc7ebca5191b4a977233a4d6d0466ed4b'
-$hubUrl = "https://github.com/dgmora/rom-hub/archive/$hubCommit.tar.gz"
+$hubCommit = 'ef025c056827423b370e8fe626cd8c4ebdc034ed'
+$hubUrl = "https://github.com/BlizzHacker/rom-hub/archive/$hubCommit.tar.gz"
 $gitVersion = '2.56.0.3'
 $gitUrl = 'https://github.com/git-for-windows/git/releases/download/v2.56.0.windows.3/MinGit-2.56.0.3-64-bit.zip'
 $gitSha = '2e5619966e588fde5f8122c5557cad50c0fbafcaed736689f40ec1dfb1d78ea7'
@@ -106,6 +107,7 @@ Copy-Item -LiteralPath $webExe[0].Directory.FullName -Destination (Join-Path $bu
 & $PythonPath -m pip install --disable-pip-version-check --no-cache-dir --target $site -r (Join-Path $repo 'requirements.txt') "rom-hub @ $hubUrl"
 if ($LASTEXITCODE -ne 0) { throw 'Could not bundle the Python dependencies and pinned ROM Hub.' }
 Copy-Item -LiteralPath (Join-Path $repo 'romarr') -Destination (Join-Path $backendApp 'romarr') -Recurse
+[IO.File]::WriteAllText((Join-Path $backendApp 'romarr\_version.py'), "__version__ = '$Version'`n")
 # _pth is relative to python.exe and is also honored by ROM Hub child processes.
 $pythonPaths = @('python313.zip', '.', 'Lib/site-packages', 'app', 'import site')
 [IO.File]::WriteAllLines((Join-Path $backend 'python313._pth'), $pythonPaths)
@@ -115,30 +117,33 @@ if ($LASTEXITCODE -ne 0) { throw 'The embedded Python package is incomplete.' }
 & (Join-Path $bundle 'git\cmd\git.exe') --version
 if ($LASTEXITCODE -ne 0) { throw 'Bundled MinGit did not run.' }
 
-# A small vector-drawn monogram supplies every Windows icon size.
+# Every Windows icon size is scaled from the official brand icon (docs/img/brand).
 Add-Type -AssemblyName System.Drawing
+$brandIconPath = Join-Path $repo 'docs\img\brand\romarr-icon-512.png'
+if (-not (Test-Path -LiteralPath $brandIconPath -PathType Leaf)) { throw "Brand icon not found: $brandIconPath" }
+$brandIcon = [Drawing.Image]::FromFile($brandIconPath)
+function New-ROMarrBrandBitmap([int]$Size) {
+    $bitmap = [Drawing.Bitmap]::new($Size,$Size,[Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $graphics = [Drawing.Graphics]::FromImage($bitmap)
+    try {
+        $graphics.Clear([Drawing.Color]::Transparent)
+        $graphics.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $graphics.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::HighQuality
+        $graphics.PixelOffsetMode = [Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        $graphics.DrawImage($brandIcon,[Drawing.Rectangle]::new(0,0,$Size,$Size))
+    } finally { $graphics.Dispose() }
+    return $bitmap
+}
 $iconPath = Join-Path $work 'ROMarr.ico'
 $iconImages = [Collections.Generic.List[byte[]]]::new()
 $iconSizes = @(16,24,32,48,64,128,256)
 foreach ($size in $iconSizes) {
-    $bitmap = [Drawing.Bitmap]::new($size,$size)
-    $graphics = [Drawing.Graphics]::FromImage($bitmap)
+    $bitmap = New-ROMarrBrandBitmap $size
     $stream = [IO.MemoryStream]::new()
-    $brush = [Drawing.SolidBrush]::new([Drawing.ColorTranslator]::FromHtml('#f2a33c'))
-    $font = [Drawing.Font]::new('Segoe UI',[single]($size*0.68),[Drawing.FontStyle]::Bold,[Drawing.GraphicsUnit]::Pixel)
-    $format = [Drawing.StringFormat]::new()
     try {
-        $graphics.Clear([Drawing.ColorTranslator]::FromHtml('#12141a'))
-        $graphics.TextRenderingHint = [Drawing.Text.TextRenderingHint]::AntiAliasGridFit
-        $format.Alignment = [Drawing.StringAlignment]::Center
-        $format.LineAlignment = [Drawing.StringAlignment]::Center
-        $graphics.DrawString('R',$font,$brush,[Drawing.RectangleF]::new(0,0,$size,$size),$format)
         $bitmap.Save($stream,[Drawing.Imaging.ImageFormat]::Png)
         $iconImages.Add($stream.ToArray())
-    } finally {
-        $format.Dispose(); $font.Dispose(); $brush.Dispose()
-        $stream.Dispose(); $graphics.Dispose(); $bitmap.Dispose()
-    }
+    } finally { $stream.Dispose(); $bitmap.Dispose() }
 }
 $iconStream = [IO.File]::Create($iconPath)
 $writer = [IO.BinaryWriter]::new($iconStream)
@@ -156,7 +161,7 @@ try {
     foreach ($image in $iconImages) { $writer.Write($image) }
 } finally { $writer.Dispose(); $iconStream.Dispose() }
 
-& dotnet publish (Join-Path $repo 'desktop\windows\ROMarr.Desktop.csproj') --configuration Release --runtime win-x64 --self-contained true --output $bundle "-p:Version=$Version" '-p:DebugType=None' '-p:DebugSymbols=false' "-p:ApplicationIcon=$iconPath"
+& dotnet publish (Join-Path $repo 'desktop\windows\ROMarr.Desktop.csproj') --configuration Release --runtime win-x64 --self-contained true --output $bundle "-p:Version=$Version" "-p:InformationalVersion=$Version" '-p:DebugType=None' '-p:DebugSymbols=false' "-p:ApplicationIcon=$iconPath"
 if ($LASTEXITCODE -ne 0) { throw 'The native desktop application did not publish.' }
 if (-not (Test-Path -LiteralPath (Join-Path $bundle 'ROMarr.exe'))) { throw 'ROMarr.exe is missing.' }
 Copy-Item -LiteralPath (Join-Path $repo 'LICENSE') -Destination (Join-Path $bundle 'LICENSE.txt')
@@ -199,22 +204,9 @@ if (-not $SkipMsix) {
     $assets = Join-Path $bundle 'Assets'
     [IO.Directory]::CreateDirectory($assets) | Out-Null
     foreach ($asset in @(@('Square44x44Logo.png',44),@('Square150x150Logo.png',150),@('StoreLogo.png',50))) {
-        $size = [int]$asset[1]
-        $bitmap = [Drawing.Bitmap]::new($size,$size)
-        $graphics = [Drawing.Graphics]::FromImage($bitmap)
-        try {
-            $graphics.Clear([Drawing.ColorTranslator]::FromHtml('#12141a'))
-            $brush = [Drawing.SolidBrush]::new([Drawing.ColorTranslator]::FromHtml('#f2a33c'))
-            $font = [Drawing.Font]::new('Segoe UI',[single]($size*0.46),[Drawing.FontStyle]::Bold,[Drawing.GraphicsUnit]::Pixel)
-            $format = [Drawing.StringFormat]::new()
-            try {
-                $format.Alignment = [Drawing.StringAlignment]::Center
-                $format.LineAlignment = [Drawing.StringAlignment]::Center
-                $graphics.TextRenderingHint = [Drawing.Text.TextRenderingHint]::AntiAliasGridFit
-                $graphics.DrawString('R',$font,$brush,[Drawing.RectangleF]::new(0,0,$size,$size),$format)
-                $bitmap.Save((Join-Path $assets $asset[0]),[Drawing.Imaging.ImageFormat]::Png)
-            } finally { $brush.Dispose(); $font.Dispose(); $format.Dispose() }
-        } finally { $graphics.Dispose(); $bitmap.Dispose() }
+        $bitmap = New-ROMarrBrandBitmap ([int]$asset[1])
+        try { $bitmap.Save((Join-Path $assets $asset[0]),[Drawing.Imaging.ImageFormat]::Png) }
+        finally { $bitmap.Dispose() }
     }
     $template = Get-Content -LiteralPath (Join-Path $repo 'desktop\windows\Package.appxmanifest') -Raw
     foreach ($entry in @{

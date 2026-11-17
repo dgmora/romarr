@@ -19,9 +19,11 @@ Lime3DS users should use Azahar. Eden and Ryubing host their own distribution si
 
 Firmware, BIOS and console keys belong in the locations specified by the emulator's setup guide. Supply your own dumps. Adding a directory to ROMarr's library does not add that directory to an emulator automatically.
 
+Longshot is listed as an experimental native-game recompilation tool for Windows and Linux. Its source mirror is [hosted here](https://git.moveweight.com/romarr-emulators/magicbeandev--longshot); open its setup guide for the upstream launcher and matching game-file requirements.
+
 ## Browse the full catalog
 
-The catalog snapshot contains 1,214 emulator, fork and companion-tool entries. Search by name, system, license or forge, and use Previous / Next to see every result. Free and noncommercial software is included; the license on each project still applies. Entries identify upstream sources and do not imply that every project has been installed or tested.
+The catalog snapshot contains 1,215 emulator, fork and companion-tool entries. Search by name, system, license or forge, and use Previous / Next to see every result. Free and noncommercial software is included; the license on each project still applies. Entries identify upstream sources and do not imply that every project has been installed or tested.
 
 **Browse forks** retrieves public fork pages directly from GitHub, GitLab or Forgejo. **More forks** continues through the network instead of stopping at a fixed list. Discovery keeps local records so they can be searched afterward. An unavailable or private project cannot be restored by catalog discovery.
 
@@ -62,6 +64,8 @@ Open **Settings → Media Management** and enable the scanners you want to requi
 Secrets stay in the server environment. Restart ROMarr after changing environment variables. The same checks apply to manual imports, completed downloads and managed emulator installations. If an enabled scanner is unavailable or ClamAV refuses the file size, the import waits. A reported infection blocks the import and appears in History.
 
 Windows Security can also act independently of ROMarr. If it quarantines a source file, check its Protection History before retrying. ROMarr cannot import a file that is no longer present.
+
+![Windows Security Protection History - Threat Quarantined](img/windows-security-quarantine-proof.png)
 
 ## MWM and Arkana inspection
 

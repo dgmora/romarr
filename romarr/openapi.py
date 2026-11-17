@@ -20,7 +20,40 @@ VERSION = "3.1.0"
 #: One line per route. Anything served and not described here fails the test,
 #: which is the whole mechanism keeping this honest.
 DESCRIPTIONS: dict[str, tuple[str, str]] = {
+    "/api/v1/soundtracks/game": ("GET", "What soundtrack RomM holds for a game (`id` = RomM game id) and what ROMarr added."),
+    "/api/v1/soundtracks/search": ("GET", "Ranked soundtrack candidates from the enabled sources, plus manual-search links."),
+    "/api/v1/soundtracks/torrents": ("GET", "Indexer search for a soundtrack with hand-typed terms; results are unscored."),
+    "/api/v1/soundtracks/torrents/grab": ("POST", "Send a picked soundtrack torrent to the download client; not imported as a ROM."),
+    "/api/v1/soundtracks/torrents/cancel": ("POST", "Stop watching a game's soundtrack torrent; the torrent stays in the download client."),
+    "/api/v1/soundtracks/library/browse": ("GET", "List one folder level of the music library: subfolders with audio counts."),
+    "/api/v1/soundtracks/download": ("POST", "Start a background download-and-upload of a candidate into RomM's Jukebox; one job per game."),
+    "/api/v1/soundtracks/jobs": ("GET", "Soundtrack jobs, newest first, with progress."),
+    "/api/v1/soundtracks/undo": ("POST", "Remove exactly the soundtrack files ROMarr added to a game."),
+    "/api/v1/soundtracks/dups": ("GET", "Verified groups of games with identical stored soundtracks, merges that can be undone, and the scan job."),
+    "/api/v1/soundtracks/dups/scan": ("POST", "Start a background scan that compares stored soundtracks byte for byte (SHA-1)."),
+    "/api/v1/soundtracks/dups/merge": ("POST", "Keep one game's soundtrack and remove the identical copies from the others; refuses a copy that differs."),
+    "/api/v1/soundtracks/dups/unmerge": ("POST", "Re-upload the kept files to a merged game after verifying them."),
+    "/api/v1/soundtracks/library/search": ("GET", "Search the read-only music library (`q`) for albums to use as a soundtrack."),
+    "/api/v1/soundtracks/library/add": ("POST", "Upload an album from the music library into a game's soundtrack through RomM."),
+    "/api/v1/soundtracks/targets": ("GET", "Configured RomM libraries and explicit soundtrack game selectors."),
+    "/api/v1/update/prs": ("GET", "List official open ROMarr pull requests for optional owner-reviewed previews."),
+    "/api/v1/update/releases": ("GET", "Published release catalogue filtered by stable, RC, beta or alpha eligibility."),
+    "/api/v1/update/pr": ("POST", "Inspect an official PR author, exact head/base and completed check results without applying code."),
+    "/api/v1/update/pr/apply": ("POST", "Explicitly approve a pinned fast-forward PR on an idle clean source installation after a private configuration backup."),
+    "/api/v1/update/pr/restore": ("POST", "Restore the recorded prior code only if the preview source and worktree remain unchanged; preserve configuration backups."),
+    "/api/v1/switch/updates": ("GET", "Bounded read-only Switch update/DLC report; refresh=1 rebuilds the cached scan."),
+    "/api/v1/switch/gaps": ("GET", "Cached-only Switch gap summary; never downloads metadata or scans disk."),
+    "/api/v1/switch/ignore": ("POST", "Set an explicit per-DLC ignore preference using tid and boolean ignored."),
+    "/api/v1/file-reports": ("GET", "Local user reports and snapshot scanner evidence; authentication required."),
+    "/api/v1/file-reports/submit": ("POST", "Report a relative library file and queue a bounded snapshot scan."),
+    "/api/v1/file-reports/quarantine": ("POST", "Explicitly quarantine unchanged reviewed bytes; never delete."),
+    "/api/v1/file-reports/restore": ("POST", "Restore quarantined bytes without overwriting an existing destination."),
+    "/api/v1/support/github": ("POST", "Prepare a reviewed GitHub issue or submit with explicit consent and an operator token."),
     "/": ("GET", "The web UI."),
+    "/manifest.webmanifest": ("GET", "Constant installable app manifest."),
+    "/service-worker.js": ("GET", "Online-only app service worker; no request interception or caching."),
+    "/app-icon-192.png": ("GET", "Constant 192 pixel app icon."),
+    "/app-icon-512.png": ("GET", "Constant 512 pixel app icon."),
     "/favicon.ico": ("GET", "The retro cartridge SVG favicon."),
     "/favicon.svg": ("GET", "The retro cartridge SVG favicon."),
     "/api/health": ("GET", "Liveness. Returns {ok} unauthenticated, the full "
@@ -69,7 +102,11 @@ DESCRIPTIONS: dict[str, tuple[str, str]] = {
                                       "-- as query parameters or a JSON body "
                                       "-- to drop a request without importing "
                                       "it."),
-    "/api/v1/queue": ("GET", "Active downloads."),
+    "/api/v1/lookup": ("GET", "Find games by IGDB title, with per-platform library, download and monitoring state. Requires q; optional platform."),
+    "/api/v1/game/detail": ("GET", "Read one game and its cached metadata, wanted entry, queue and history; platform plus id or title."),
+    "/api/v1/wanted/add": ("POST", "Save a game/platform with boolean monitored (default true) and search (default false). Wishlist entries use monitored=false and are skipped by automatic searches."),
+    "/api/v1/wanted/monitor": ("POST", "Set boolean monitored for an existing game/platform; false pauses automatic searches without removing the entry."),
+    "/api/v1/queue": ("GET", "Active downloads, import-preview availability and client-scoped progress/ETA when available."),
     "/api/queue": ("GET", "Active downloads (legacy path)."),
     "/api/v1/history": ("GET", "What ROMarr has done."),
     "/api/v1/config": ("GET", "Settings, with every credential masked."),
@@ -164,7 +201,7 @@ DESCRIPTIONS: dict[str, tuple[str, str]] = {
     "/api/v1/hub/igir": ("GET", "Igir v5.8.0 1G1R front-end status, default profile, and CLI execution (POST runs or previews an Igir 1G1R job with {romm} output tokens)."),
     "/api/v1/hub/exo2romm": ("GET", "eXo2romm eXoDOS-to-RomM ZIP repackager status, attribution to derkommutator, and defaults (POST previews or repackages eXoDOS game zips)."),
     "/api/v1/hub/fleet": ("GET", "Multi-device and network library sync profiles for ES-DE, RetroPie/ArcadePunks, Batocera, Argosy, Grout, Steam Deck, and RetroArch WebDAV (POST builds a 1G1R + gamelist.xml sync plan)."),
-    "/api/v1/mcp": ("GET", "Model Context Protocol (MCP) tool manifest and Open-Eyes desktop bridge configuration for ROMarr."),
+    "/api/v1/mcp": ("GET", "MCP connection manifest (GET), or authenticated stateless JSON-RPC MCP transport (POST). GET text/event-stream returns 405; no standalone SSE stream is offered."),
     "/api/v1/hub/archive-org/auth": ("POST", "Save or clear host-managed Archive.org credentials; returns status without credentials."),
     "/api/v1/hub/plugin": ("POST", "Install, enable, disable or uninstall a plugin."),
     "/api/v1/hub/source/check": ("POST", "Whether a repository URL may be "
@@ -354,6 +391,10 @@ DESCRIPTIONS: dict[str, tuple[str, str]] = {
     "/api/v1/emulators/cores/configure": ("POST", "Create a dedicated RetroArch configuration and save directories."),
     "/api/v1/emulators/release": ("GET", "Check the selected emulator's official release assets."),
     "/api/v1/emulators/install": ("POST", "Verify, scan and install a portable emulator on the ROMarr host."),
+    "/api/v1/emulators/plug-and-play": ("POST", "One-click plug-and-play setup configuring Cartridge and recommended emulators."),
+    "/api/v1/cartridge/status": ("GET", "Check Cartridge player installation and available platforms."),
+    "/api/v1/cartridge/install": ("POST", "Auto-install the verified portable Cartridge player."),
+    "/api/v1/cartridge/launch": ("POST", "Launch Cartridge player paired with ROMarr."),
     "/api/v1/security/inspect": ("POST", "Inspect an explicitly selected shared file with MWM or Arkana."),
     "/api/v1/downloadclient/mdm": ("GET", "Availability of the external "
                                           "Mister Download Manager CLI for "
@@ -363,6 +404,7 @@ DESCRIPTIONS: dict[str, tuple[str, str]] = {
                                                    "and install the companion "
                                                    "Mister Download Manager "
                                                    "binaries locally."),
+    "/api/v1/game/nfo": ("GET", "Read a bounded same-stem NFO for a cached local folder game; unsupported platforms fail closed."),
     "/api/v1/library": ("GET", "Configured library servers."),
     "/api/v1/library/schema": ("GET", "Library backend types and their fields."),
     "/api/v1/library/config": ("GET", "One library's stored configuration."),
@@ -477,6 +519,10 @@ def spec(version: str = "0.0.0", *, base_url: str = "") -> dict:
     for path in sorted(DESCRIPTIONS):
         method, summary = DESCRIPTIONS[path]
         paths[path] = _operation(path, method, summary)
+    paths["/api/v1/mcp"].update(_operation(
+        "/api/v1/mcp", "POST", "Stateless MCP JSON-RPC initialize, ping, tools/list and tools/call. Requires an explicit API-key header even when REST auth is disabled."))
+    paths["/api/v1/mcp"]["post"]["requestBody"] = {
+        "required": True, "content": {"application/json": {"schema": {"type": "object"}}}}
     paths["/api/v1/queue/import-plan"].update(_operation(
         "/api/v1/queue/import-plan", "GET", "Read-only payload preview for a completed queue item; returns grouped companions, excluded extras, sizes and an approval token."))
     paths["/api/v1/queue/import-plan"]["get"]["parameters"] = [

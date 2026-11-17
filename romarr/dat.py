@@ -63,6 +63,93 @@ class Game:
     #: No-Intro marks regional variants as clones of a parent entry. This is
     #: what makes 1G1R possible at all.
     cloneof: str = ""
+    #: Normalised two-letter language codes declared by the DAT's `language`
+    #: field (e.g. `("en", "fr")` from `language "English / French"`).
+    languages: tuple[str, ...] = ()
+
+
+#: Language codes and names normalised to two-letter ISO 639-1 codes so
+#: `language "English / French"` in a DAT, `[T-Fr]` in a filename, and
+#: `"French, English"` in settings all speak the same vocabulary.
+_LANG_ALIASES = {
+    "en": "en", "eng": "en", "english": "en",
+    "de": "de", "deu": "de", "ger": "de", "german": "de",
+    "fr": "fr", "fra": "fr", "fre": "fr", "french": "fr",
+    "es": "es", "spa": "es", "esp": "es", "spanish": "es",
+    "it": "it", "ita": "it", "italian": "it",
+    "pt": "pt", "por": "pt", "ptb": "pt", "portuguese": "pt",
+    "nl": "nl", "dut": "nl", "nla": "nl", "dutch": "nl",
+    "sv": "sv", "swe": "sv", "swedish": "sv",
+    "ru": "ru", "rus": "ru", "russian": "ru",
+    "ja": "ja", "jpn": "ja", "jp": "ja", "japanese": "ja",
+    "ko": "ko", "kor": "ko", "korean": "ko",
+    "zh": "zh", "chi": "zh", "chn": "zh", "chinese": "zh",
+    "pl": "pl", "pol": "pl", "polish": "pl",
+    "da": "da", "dan": "da", "danish": "da",
+    "fi": "fi", "fin": "fi", "finnish": "fi",
+    "no": "no", "nor": "no", "norwegian": "no", "nb": "nb", "nn": "nn",
+    "cs": "cs", "cze": "cs", "ces": "cs", "czech": "cs",
+    "hu": "hu", "hun": "hu", "hungarian": "hu",
+    "el": "el", "gre": "el", "ell": "el", "greek": "el",
+    "tr": "tr", "tur": "tr", "turkish": "tr",
+    "ar": "ar", "ara": "ar", "arabic": "ar",
+    "he": "he", "heb": "he", "hebrew": "he",
+    "ca": "ca", "cat": "ca", "catalan": "ca",
+    "ro": "ro", "rum": "ro", "ron": "ro", "romanian": "ro",
+    "bg": "bg", "bul": "bg", "bulgarian": "bg",
+    "hr": "hr", "hrv": "hr", "croatian": "hr",
+    "sk": "sk", "slo": "sk", "slk": "sk", "slovak": "sk",
+    "sl": "sl", "slv": "sl", "slovenian": "sl",
+    "uk": "uk", "ukr": "uk", "ukrainian": "uk",
+    "vi": "vi", "vie": "vi", "vietnamese": "vi",
+    "th": "th", "tha": "th", "thai": "th",
+    "id": "id", "ind": "id", "indonesian": "id",
+    "ms": "ms", "may": "ms", "msa": "ms", "malay": "ms",
+}
+
+_TWO_LETTER_LANGS = frozenset(_LANG_ALIASES.values())
+_PAREN_GROUP = re.compile(r"\(([^)]+)\)")
+
+
+def normalise_lang(code: str) -> str:
+    """Normalise a language code or name to its two-letter form."""
+    c = (code or "").strip().lower()
+    return _LANG_ALIASES.get(c, c)
+
+
+def parse_dat_languages(raw: str) -> tuple[str, ...]:
+    """Parse a DAT `language` string (e.g. `"English / Japanese"`) into
+    deduplicated, normalised language codes, preserving declaration order."""
+    text = (raw or "").strip()
+    if not text:
+        return ()
+    tokens = re.split(r"[/,+&;|]+", text)
+    seen: list[str] = []
+    for tok in tokens:
+        code = normalise_lang(tok)
+        if code and code not in seen:
+            seen.append(code)
+    return tuple(seen)
+
+
+def game_languages(game: Game) -> tuple[str, ...]:
+    """Return known language codes for `game`, or `()` when unknown.
+
+    Authoritative DAT `language` metadata wins; otherwise, explicit No-Intro
+    language tags like `(En,Fr,De)` in the title are accepted without guessing
+    language from region names like `(USA)` or `(Japan)`.
+    """
+    if game.languages:
+        return game.languages
+    for group in _PAREN_GROUP.findall(game.name or ""):
+        parts = [p.strip().lower() for p in re.split(r"[,/]+", group) if p.strip()]
+        if (
+            parts
+            and all(len(p) == 2 and p.isascii() and p.isalpha() for p in parts)
+            and any(p in _TWO_LETTER_LANGS for p in parts)
+        ):
+            return tuple(dict.fromkeys(parts))
+    return ()
 
 
 @dataclass(frozen=True)
@@ -268,6 +355,8 @@ class Dat:
     name: str = ""
     version: str = ""
     games: dict[str, Game] = field(default_factory=dict)
+    # Duplicate labels make request completeness ambiguous, even when hashes match.
+    _ambiguous_game_names: set[str] = field(default_factory=set)
     _by_crc: dict[tuple[str, int], tuple[str, Rom]] = field(default_factory=dict)
     _by_sha1: dict[str, tuple[str, Rom]] = field(default_factory=dict)
     _by_md5: dict[str, tuple[str, Rom]] = field(default_factory=dict)
@@ -283,10 +372,14 @@ class Dat:
         theoretical -- so where the DAT published a SHA1 and the caller
         computed one, that is the answer and CRC is not consulted.
         """
-        for key, table in ((sha1, self._by_sha1), (md5, self._by_md5)):
-            hit = table.get(str(key or "").lower())
-            if hit:
-                return Match(VERIFIED, hit[0], hit[1], self.name)
+        sha1 = str(sha1 or "").lower()
+        hit = self._by_sha1.get(sha1)
+        if hit:
+            return Match(VERIFIED, hit[0], hit[1], self.name)
+
+        hit = self._by_md5.get(str(md5 or "").lower())
+        if hit and not (sha1 and hit[1].sha1 and sha1 != hit[1].sha1):
+            return Match(VERIFIED, hit[0], hit[1], self.name)
 
         crc = str(crc or "").lower()
         if crc:
@@ -294,7 +387,7 @@ class Dat:
             if hit is None and not size:
                 hit = next((v for (c, _), v in self._by_crc.items() if c == crc),
                            None)
-            if hit:
+            if hit and not (sha1 and hit[1].sha1 and sha1 != hit[1].sha1):
                 return Match(VERIFIED, hit[0], hit[1], self.name)
 
         # Nothing matched. A file the exact size of a known ROM is the case
@@ -352,8 +445,12 @@ class Dat:
             return base_title(game)
         return base_title(entry.cloneof or entry.name)
 
-    def one_game_one_rom(self, regions: list[str]) -> dict[str, Game]:
-        """One entry per game, choosing by region preference.
+    def one_game_one_rom(
+        self,
+        regions: list[str],
+        languages: list[str] | None = None,
+    ) -> dict[str, Game]:
+        """One entry per game, choosing by optional language then region preference.
 
         Igir's headline feature and the reason a 10,000-entry set collapses to
         a playable 3,000. The ladder is supplied by the caller so that a 1G1R
@@ -369,8 +466,17 @@ class Dat:
             groups.setdefault(self.group_key(game.name), []).append(game)
 
         order = [r.lower() for r in regions]
+        lang_order = [normalise_lang(l) for l in (languages or ()) if str(l).strip()]
 
-        def rank(game: Game) -> tuple[int, int, int, str]:
+        def rank(game: Game) -> tuple[int, int, int, int, str]:
+            if lang_order:
+                g_langs = game_languages(game)
+                lang_best = min(
+                    (lang_order.index(l) for l in g_langs if l in lang_order),
+                    default=len(lang_order),
+                )
+            else:
+                lang_best = 0
             found = _regions_in(game.name)
             best = min((order.index(r) for r in found if r in order),
                        default=len(order))
@@ -380,7 +486,7 @@ class Dat:
             # without cloneof relationships. Keep promo/debug-only games.
             variant = bool(re.search(r"[\(\[][^)\]]*\b(debug|promo)\b",
                                      game.name, re.IGNORECASE))
-            return (best, int(variant), 0 if not game.cloneof else 1, game.name)
+            return (lang_best, best, int(variant), 0 if not game.cloneof else 1, game.name)
 
         return {min(members, key=rank).name: min(members, key=rank)
                 for members in groups.values()}
@@ -443,6 +549,11 @@ def _parse_clrmamepro(body: str) -> Dat:
         if cl:
             clone = (cl.group(1) if cl.group(1) is not None
                      else cl.group(2)).strip()
+        raw_lang = ""
+        lg = re.search(r'^\s*languages?\s+(?:"([^"]*)"|(\S+))', block, re.M)
+        if lg:
+            raw_lang = (lg.group(1) if lg.group(1) is not None
+                        else lg.group(2)).strip()
 
         roms = []
         for line in re.finditer(r"^\s*rom\s*\((.*?)\)\s*$", block, re.M):
@@ -466,7 +577,14 @@ def _parse_clrmamepro(body: str) -> Dat:
                 dat._by_md5.setdefault(rom.md5, (name, rom))
             if rom.size:
                 dat._sizes.setdefault(rom.size, name)
-        dat.games[name] = Game(name=name, roms=tuple(roms), cloneof=clone)
+        if name in dat.games:
+            dat._ambiguous_game_names.add(name)
+        dat.games[name] = Game(
+            name=name,
+            roms=tuple(roms),
+            cloneof=clone,
+            languages=parse_dat_languages(raw_lang),
+        )
     return dat
 
 
@@ -535,7 +653,21 @@ def parse_dat(body: str) -> Dat:
         parent = (node.get("cloneof") or "").strip()
         if not parent:
             parent = ids.get((node.get("cloneofid") or "").strip(), "")
-        dat.games[name] = Game(name=name, roms=tuple(roms), cloneof=parent)
+        raw_lang = (
+            node.get("language")
+            or node.findtext("language")
+            or node.get("languages")
+            or node.findtext("languages")
+            or ""
+        ).strip()
+        if name in dat.games:
+            dat._ambiguous_game_names.add(name)
+        dat.games[name] = Game(
+            name=name,
+            roms=tuple(roms),
+            cloneof=parent,
+            languages=parse_dat_languages(raw_lang),
+        )
     return dat
 
 
@@ -550,10 +682,94 @@ class DatIndex:
 
     def __init__(self):
         self.dats: list[Dat] = []
+        # Sparse collision indexes: the legacy per-hash indexes intentionally
+        # return their first entry. Request approval must retain other entries.
+        self._duplicate_hits: list[tuple[dict, dict, dict]] = []
 
     def add(self, dat: Dat) -> None:
-        if dat.games:
-            self.dats.append(dat)
+        if not dat.games:
+            return
+        extra_crc: dict = {}
+        extra_md5: dict = {}
+        extra_sha1: dict = {}
+        for game_name, game in dat.games.items():
+            for rom in game.roms:
+                identity = (game_name, rom)
+                for key, first, extras in (
+                    ((rom.crc, rom.size) if rom.crc else None, dat._by_crc, extra_crc),
+                    (rom.md5 or None, dat._by_md5, extra_md5),
+                    (rom.sha1 or None, dat._by_sha1, extra_sha1),
+                ):
+                    if key is not None and key in first and first[key] != identity:
+                        hits = extras.setdefault(key, [])
+                        if identity not in hits:
+                            hits.append(identity)
+        self.dats.append(dat)
+        self._duplicate_hits.append((extra_crc, extra_md5, extra_sha1))
+
+    def verified_candidates(self, **hashes) -> tuple[Match, ...]:
+        """Expose every matching DAT identity, including same-catalog collisions.
+
+        Preserve legacy lookup's first-match semantics for existing callers.
+        Collision maps are built only once on catalog addition, rather than
+        scanning millions of DAT records for every imported ROM.
+        """
+        candidates = []
+        sha1 = str(hashes.get("sha1") or "").lower()
+        md5 = str(hashes.get("md5") or "").lower()
+        crc = str(hashes.get("crc") or "").lower()
+        size = int(hashes.get("size") or 0)
+
+        def hashes_agree(rom: Rom) -> bool:
+            # Legacy lookup can fall back to CRC, but requests must not trust
+            # a candidate whose stronger declared hashes disagree.
+            return not ((size and rom.size and size != rom.size)
+                        or (sha1 and rom.sha1 and sha1 != rom.sha1)
+                        or (md5 and rom.md5 and md5 != rom.md5))
+
+        for dat, (extra_crc, extra_md5, extra_sha1) in zip(self.dats, self._duplicate_hits):
+            match = dat.lookup(**hashes)
+            if match.status != VERIFIED:
+                continue
+            if sha1 and sha1 in dat._by_sha1:
+                extra = extra_sha1.get(sha1, ())
+            elif md5 and md5 in dat._by_md5:
+                extra = extra_md5.get(md5, ())
+            elif crc and size and (crc, size) in dat._by_crc:
+                extra = extra_crc.get((crc, size), ())
+            else:
+                # A CRC without file size is not enough to establish unique
+                # identity when distinct sizes may share that CRC.
+                continue
+            if match.rom is not None and hashes_agree(match.rom):
+                candidates.append(match)
+            candidates.extend(
+                Match(VERIFIED, name, rom, dat.name)
+                for name, rom in extra if hashes_agree(rom)
+            )
+        return tuple(candidates)
+
+    def game_rom_count(self, match: Match) -> int | None:
+        """Count all declared ROMs for a uniquely identified, verified DAT game.
+
+        A Match carries a display catalog name, not a stable catalog ID.
+        Missing or duplicate matching catalogs must not certify completeness.
+        Preserve first-match lookup compatibility for legacy import callers.
+        """
+        if (match.status != VERIFIED or match.rom is None
+                or not match.dat or not match.game):
+            return None
+        # A repeated game label can hide members in either DAT parser. Do not
+        # certify a request from the surviving record, regardless of hash hit.
+        if any(dat.name == match.dat and match.game in dat._ambiguous_game_names
+               for dat in self.dats):
+            return None
+        games = [game for dat in self.dats if dat.name == match.dat
+                 if (game := dat.games.get(match.game)) is not None
+                 and match.rom in game.roms]
+        if len(games) != 1:
+            return None
+        return len(games[0].roms)
 
     def lookup(self, **hashes) -> Match:
         best = Match(UNKNOWN)

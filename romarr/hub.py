@@ -15,10 +15,87 @@ import dataclasses
 import logging
 import os
 import re
+import sys
+import threading
 from pathlib import Path
 from .platforms import resolve, same_machine
 
 log = logging.getLogger(__name__)
+
+_FLARESOLVERR_LOCK = threading.Lock()
+_FLARESOLVERR_URL = ""
+
+
+def configure_flaresolverr(url: str | None) -> None:
+    """Set the operator-configured FlareSolverr URL for host-side Hub HTTP."""
+    global _FLARESOLVERR_URL
+    with _FLARESOLVERR_LOCK:
+        _FLARESOLVERR_URL = str(url or "").strip().rstrip("/")
+
+
+def flaresolverr_url() -> str:
+    """Return the active FlareSolverr URL from settings or environment."""
+    with _FLARESOLVERR_LOCK:
+        configured = _FLARESOLVERR_URL
+    return configured or os.environ.get("ROM_HUB_FLARESOLVERR_URL", "").strip().rstrip("/")
+
+
+def _build_fetcher(HttpxFetcher, *, timeout: float | None = None, transport=None):
+    """Construct HttpxFetcher, passing flaresolverr_url when supported."""
+    kwargs = {"transport": transport}
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    solver = flaresolverr_url()
+    if solver:
+        try:
+            return HttpxFetcher(**kwargs, flaresolverr_url=solver)
+        except TypeError:
+            pass
+    return HttpxFetcher(**kwargs)
+
+
+def _wrap_download_transport(base_transport):
+    """Wrap an httpx download transport with FlareSolverr when configured.
+
+    For binary downloads, solving a Cloudflare challenge must retry the
+    original request against the inner transport using the cached clearance
+    cookie rather than returning the solver's HTML wrapper page as the file.
+    """
+    solver = flaresolverr_url()
+    if not solver:
+        return base_transport
+    try:
+        import httpx
+        from rom_hub.flaresolverr import (
+            FlareSolverrTransport,
+            is_cloudflare_challenge,
+            normalize_flaresolverr_url,
+        )
+        normalized = normalize_flaresolverr_url(solver)
+        if not normalized:
+            return base_transport
+
+        class _BinaryDownloadSolverTransport(FlareSolverrTransport):
+            def handle_request(self, request: httpx.Request) -> httpx.Response:
+                req = self._apply_cached(request)
+                response = self._inner.handle_request(req)
+                if request.method.upper() != "GET" or response.status_code not in (403, 503):
+                    return response
+                body = response.read()
+                if not is_cloudflare_challenge(response.status_code, response.headers, body):
+                    return httpx.Response(
+                        status_code=response.status_code,
+                        headers=response.headers,
+                        content=body,
+                        request=req,
+                    )
+                response.close()
+                self._solve(str(request.url))
+                return self._inner.handle_request(self._apply_cached(request))
+
+        return _BinaryDownloadSolverTransport(normalized, inner=base_transport)
+    except Exception:
+        return base_transport
 
 # ROM Hub keeps its state (catalog cache, installed plugins) under this home.
 # ROMarr gives it a stable directory it owns so state survives restarts.
@@ -32,7 +109,7 @@ os.environ.setdefault("ROM_HUB_HOME", str(HOME))
 
 
 def _backend_env() -> dict:
-    """Hand ROMarr's own library credentials to the Hub.
+    """Share backend connection details; credentials require an explicit grant.
 
     ROMarr already knows which library it files into and how to authenticate to
     it; the Hub needs the same thing to run `import` and `enrich`. Left to
@@ -49,10 +126,21 @@ def _backend_env() -> dict:
     if url:
         env["ROMM_URL"] = url
         env["ROM_HUB_BACKEND"] = kind
-    if user:
-        env["ROMM_USER"] = user
-    if pw:
-        env["ROMM_PASSWORD"] = pw
+    if os.environ.get("ROMARR_PLUGIN_BACKEND_CREDENTIALS") == "1":
+        if user:
+            env["ROMM_USER"] = user
+        if pw:
+            env["ROMM_PASSWORD"] = pw
+    elif url:
+        # Embedded URL credentials are the same grant as a separate password.
+        from urllib.parse import urlsplit, urlunsplit
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            env.pop("ROMM_URL", None)
+        else:
+            env["ROMM_URL"] = urlunsplit((parts.scheme, parts.netloc.rsplit("@", 1)[-1],
+                                          parts.path, "", ""))
     return env
 
 
@@ -68,6 +156,9 @@ def _import():
 
 
 def available() -> bool:
+    """Report whether this runtime can use the separately installed plugin host."""
+    if os.environ.get("ROMARR_ANDROID") == "1":
+        return False
     try:
         _import()
         return True
@@ -185,36 +276,51 @@ def sandbox_state() -> tuple[bool, str]:
         return False, f"sandbox probe failed: {err.__class__.__name__}{suffix}"
 
 
-def _plugin_env() -> dict:
-    """The environment a plugin subprocess runs with.
-
-    Built by allowlist rather than by subtraction: a denylist silently stops
-    covering anything added later, and the thing added later is exactly the
-    credential nobody thought about.
-    """
+def _host_env() -> dict:
+    """Build the sanitized environment for trusted host helpers."""
     env = {name: os.environ[name] for name in _ENV_PASSTHROUGH
            if name in os.environ}
     env["ROM_HUB_HOME"] = str(HOME)
-    # CLI diagnostics and plugin names must round-trip on Windows too.
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
-    ok, why = sandbox_state()
-    if not ok:
-        # Asked for, never assumed. ROMarr used to set this unconditionally on
-        # the belief that its container could not confine a plugin. That was
-        # wrong: the Hub's seccomp filter needs `pyseccomp` and nothing else,
-        # so the only thing standing between plugins and a real boundary was a
-        # missing dependency -- and setting the flag turned off the network and
-        # exec confinement the Hub exists to provide.
-        #
-        # The Hub's own words for this flag are "no confinement at all ... a
-        # development convenience, never a deployment setting". So it is set
-        # only when the sandbox genuinely cannot be installed, and loudly.
-        fix = ("Install pyseccomp to restore it." if "pyseccomp" in why
-               else "Plugins will run with no network or exec confinement.")
-        log.warning("running plugins WITHOUT confinement: %s. %s", why, fix)
-        env["ROM_HUB_ALLOW_UNSANDBOXED"] = "1"
     env.update(_backend_env())
+    return env
+
+
+def _confinement_possible() -> bool:
+    """Seccomp exists only on Linux; elsewhere there is nothing to install."""
+    return sys.platform.startswith("linux")
+
+
+def _sandbox_policy() -> bool:
+    """Require confinement wherever it can exist, unless the operator opts out.
+
+    On Linux a missing filter is a fixable deployment gap, so plugins are
+    refused until it is fixed or explicitly waived. Windows and macOS have no
+    seccomp at all; refusing there would only remove the plugin feature the
+    desktop apps ship, so plugins run unconfined with a warning, as before.
+    """
+    ok, why = sandbox_state()
+    if ok:
+        return False
+    if not _confinement_possible():
+        log.warning("running plugins WITHOUT confinement: %s; seccomp is Linux-only, "
+                    "so plugins on this system have no network or exec boundary", why)
+        return True
+    if os.environ.get("ROMARR_ALLOW_UNSANDBOXED_PLUGINS") != "1":
+        raise RuntimeError(
+            "ROM Hub plugin confinement is unavailable: " + why
+            + ". Install Linux pyseccomp or explicitly set "
+            "ROMARR_ALLOW_UNSANDBOXED_PLUGINS=1 to allow no confinement.")
+    log.warning("running plugins WITHOUT confinement by explicit operator choice: %s", why)
+    return True
+
+
+def _plugin_env() -> dict:
+    """Apply the same fail-closed policy to the Hub CLI and worker bridge."""
+    env = _host_env()
+    if _sandbox_policy():
+        env["ROM_HUB_ALLOW_UNSANDBOXED"] = "1"
     return env
 
 
@@ -225,25 +331,28 @@ def _run_cli(*args, timeout=180):
     shelling out to its entry point is the honest way to reuse them without
     copying the registry-mutation code here.
 
-    The subprocess runs with `_plugin_env()`, which confines it via the Hub's
-    seccomp sandbox when pyseccomp is available and only sets
-    ROM_HUB_ALLOW_UNSANDBOXED (with a warning) when the sandbox cannot be
-    installed. Installing a plugin still runs that plugin's code with ROMarr's
-    own privileges inside the confined environment; `_plugin_env` limits what
-    it inherits.
+    `_plugin_env()` refuses automatic fallback when confinement is unavailable.
+    This CLI manages installed plugin state; search and fetch workers use the
+    Hub's seccomp boundary and ROMarr's trusted interpreter startup adapter.
+    Backend credentials are shared only after an explicit operator grant.
     """
     import subprocess
     import sys
     # The Hub ships a `rom-hub` console script next to the interpreter; it has no
     # `python -m rom_hub` entry point. Prefer the script; fall back to the CLI
     # module's main() if the script isn't on PATH.
+    if os.environ.get("ROMARR_ANDROID") == "1" or sys.platform == "android":
+        return {"ok": False, "out": "", "err": "ROM Hub subprocess plugins are not bundled with Android. Connect to a ROMarr server for plugin sources.", "code": -1}
     script = Path(sys.executable).with_name("rom-hub")
     if script.exists():
         cmd = [str(script), *args]
     else:
         cmd = [sys.executable, "-c",
                "import sys; from rom_hub.cli import main; sys.exit(main())", *args]
-    env = _plugin_env()
+    try:
+        env = _plugin_env()
+    except RuntimeError as exc:
+        return {"ok": False, "out": "", "err": str(exc), "code": -1}
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
         ok = p.returncode == 0
@@ -368,15 +477,11 @@ def decode_result(url: str) -> dict:
 
 
 def _unsandboxed() -> bool:
-    """Whether Hub calls from this process may run plugins unconfined.
-
-    Only when the sandbox genuinely cannot run here -- the same rule
-    `_plugin_env` applies to subprocesses. Asked for, never assumed.
-    """
-    ok, why = sandbox_state()
-    if not ok:
-        log.warning("ROM Hub calls run WITHOUT confinement: %s", why)
-    return not ok
+    """Apply explicit policy and trusted startup before the Hub launches workers."""
+    allow = _sandbox_policy()
+    from .plugin_safety import install_trusted_startup
+    install_trusted_startup()
+    return allow
 
 
 def archive_org_auth_status() -> dict:
@@ -416,6 +521,25 @@ def searchable_plugins() -> list[str]:
                                        or ()))
     except Exception:
         return []
+
+
+def _search_platform(platform: str | None) -> str | None:
+    """Translate ROMarr IDs/labels to the shared ROM Hub source vocabulary.
+
+    Archive.org, No-Intro and other Hub sources use RomM identifiers for
+    these machines. Keep this conversion at the plugin boundary: persisted
+    ROMarr IDs and collection-path filtering must retain their own identity.
+    Unknown plugin-specific IDs pass through without broadening the search.
+    """
+    resolved = resolve(platform) if platform else None
+    slug = resolved.slug if resolved else platform
+    return {
+        "genesis-slash-megadrive": "genesis",
+        "turbografx16--1": "tg16",
+        "odyssey-2-slash-videopac-g7000": "odyssey-2",
+        "sinclair-zx81": "zx81",
+        "apple2": "appleii",
+    }.get(slug, slug)
 
 
 def search(query: str, platform: str | None = None, limit: int = 25,
@@ -478,13 +602,13 @@ def search(query: str, platform: str | None = None, limit: int = 25,
             continue
         try:
             transport = archive_transport(auth_slug, HOME) if auth_slug else None
-            fetcher = HttpxFetcher(timeout=max(60.0, timeout), transport=transport)
+            fetcher = _build_fetcher(HttpxFetcher, timeout=max(60.0, timeout), transport=transport)
         except Exception as exc:
             auth_error = f"Archive.org authentication setup failed: {type(exc).__name__}: {exc}"
             continue
         try:
             outcome = search_all(group, fetcher=fetcher, query=query,
-                                 platform=platform, limit=call_limit, timeout=timeout,
+                                 platform=_search_platform(platform), limit=call_limit, timeout=timeout,
                                  allow_unsandboxed=_unsandboxed())
         except Exception as exc:
             auth_error = f"ROM Hub search failed: {type(exc).__name__}: {exc}"
@@ -675,12 +799,13 @@ def _fetch_one(row: dict, dest_dir) -> dict:
     except ImportError:
         archive_transport = lambda *a, **k: None
     try:
-        fetcher = HttpxFetcher(transport=archive_transport(slug, HOME))
+        fetcher = _build_fetcher(HttpxFetcher, transport=archive_transport(slug, HOME))
     except Exception as exc:
         return {"ok": False,
                 "error": f"Archive.org authentication setup failed: {type(exc).__name__}: {exc}",
                 "files": []}
     try:
+        dl_transport = _wrap_download_transport(archive_transport(slug, HOME))
         with PluginProcess(plugin_dir=plugin.path, manifest=plugin.manifest,
                            config=getattr(plugin, "config", {}) or {},
                            fetcher=fetcher,
@@ -689,12 +814,14 @@ def _fetch_one(row: dict, dest_dir) -> dict:
             with HttpDownloader(
                     allowlist=list(getattr(plugin.manifest, "network", [])
                                    or []),
-                    transport=archive_transport(slug, HOME)) as downloader:
+                    transport=dl_transport) as downloader:
                 files = []
                 for f in _disc_plan_files(row, plan.files, exact_disc):
+                    dl_kwargs = {"headers": f.headers} if getattr(f, "headers", None) else {}
                     saved = downloader.download(f.url,
                                                 dest / f.relative_path(),
-                                                f.size_bytes, headers=f.headers)
+                                                f.size_bytes,
+                                                **dl_kwargs)
                     files.append(str(saved))
     except Exception as exc:
         return {"ok": False,
@@ -891,7 +1018,7 @@ def run_igir(cfg: dict | None = None, timeout: int = 600) -> dict:
             "out": "",
         }
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=_plugin_env())
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=_host_env())
         return {
             "ok": proc.returncode == 0,
             "command": cmd_str,
@@ -905,169 +1032,328 @@ def run_igir(cfg: dict | None = None, timeout: int = 600) -> dict:
         return {"ok": False, "command": cmd_str, "error": str(exc), "out": ""}
 
 
-# -------------------------------------- Device Fleet & Supportive Shell API --
+# --------------------------------------------------- Devices (fleet) API --
+#
+# Two different kinds of device, and the page treats them differently:
+#
+#   kind "files"  a device whose frontend reads a ROM folder (ES-DE, RetroPie,
+#                 Batocera, EmuDeck, Android handhelds). ROMarr plans an Igir
+#                 copy of verified games into that folder, laid out with the
+#                 frontend's own platform folder names (the Igir token), and,
+#                 when the device is remote, the rsync/rclone step to get there.
+#   kind "app"    a device running an app that talks to your library server
+#                 (Argosy, Grout, DeckRommSync, RetroArch cloud sync, console
+#                 feeds). Nothing is copied; the plan is the setup steps.
+#
+# Plans are non-destructive unless the caller asks for a mirror: no Igir
+# `clean`, no `rsync --delete`, `rclone copy` rather than `rclone sync`. A
+# device folder usually holds games and saves that are not in the library.
 
 DEVICE_PROFILES: list[dict] = [
     {
         "id": "es-de",
+        "kind": "files",
         "name": "ES-DE (EmulationStation Desktop Edition)",
-        "category": "Frontend / Desktop & Handheld",
-        "protocol": "Local / SMB / NFS / SSH + gamelist.xml",
-        "default_path": "~/ROMs/{platform}",
+        "category": "Desktop and handheld frontend",
+        "protocol": "Folder, SMB/NFS share or SSH",
+        "default_path": "~/ROMs",
+        "default_ssh_host": "user@device.local",
         "gamelist_format": "esde",
         "igir_token": "{es}",
-        "description": "Generates ES-DE gamelist.xml per platform and syncs verified 1G1R ROM subsets over LAN, SMB, or SSH.",
+        "description": "ES-DE on Windows, macOS, Linux or Android. Games are copied into its ROMs folder with ES-DE's platform folder names.",
     },
     {
         "id": "retropie-arcadepunks",
-        "name": "Raspberry Pi — RetroPie / ArcadePunks / Batocera",
-        "category": "SBC / Cabinet / Bartop",
-        "protocol": "SSH / rsync / SFTP / SMB (\\retropie\roms)",
-        "default_path": "/home/pi/RetroPie/roms/{platform}",
+        "kind": "files",
+        "name": "RetroPie (Raspberry Pi, including ArcadePunks RetroPie images)",
+        "category": "Raspberry Pi and arcade cabinets",
+        "protocol": "SSH (rsync) or the \\\\retropie\\roms share",
+        "default_path": "/home/pi/RetroPie/roms",
+        "default_ssh_host": "pi@retropie.local",
+        "gamelist_format": "esde",
+        "igir_token": "{es}",
+        "description": "RetroPie uses EmulationStation folder names under /home/pi/RetroPie/roms.",
+    },
+    {
+        "id": "rpi-batocera-arcadepunks",
+        "kind": "files",
+        "name": "Batocera (including Arcade Punks Batocera images)",
+        "category": "Raspberry Pi, PC and arcade cabinets",
+        "protocol": "SSH (rsync) or the \\\\batocera\\share\\roms share",
+        "default_path": "/userdata/roms",
+        "default_ssh_host": "root@batocera.local",
         "gamelist_format": "esde",
         "igir_token": "{batocera}",
-        "description": "Audits existing RetroPie, Batocera, or ArcadePunks image ROM folders against No-Intro/Redump DATs, prunes duplicates with Igir 1G1R, and updates gamelist.xml.",
+        "description": "Batocera 40+ and Arcade Punks Batocera packs keep ROMs under /userdata/roms with Batocera's folder names.",
+    },
+    {
+        "id": "steamos-deck",
+        "kind": "files",
+        "name": "Steam Deck / SteamOS (EmuDeck or RetroDECK)",
+        "category": "Handheld PC",
+        "protocol": "Folder, SD card or SSH",
+        "default_path": "~/Emulation/roms",
+        "default_ssh_host": "deck@steamdeck.local",
+        "gamelist_format": "esde",
+        "igir_token": "{es}",
+        "description": "EmuDeck keeps ROMs in ~/Emulation/roms (or the same path on the SD card) with ES-DE folder names.",
+    },
+    {
+        "id": "adreno-android-handhelds",
+        "kind": "files",
+        "name": "Android handhelds — Snapdragon / Adreno (Odin 2, Retroid Pocket, AYN, Ayaneo)",
+        "category": "Android handheld",
+        "protocol": "microSD card, MTP or SSH (Termux)",
+        "default_path": "/storage/emulated/0/ROMs",
+        "default_ssh_host": "user@android.local",
+        "gamelist_format": "esde",
+        "igir_token": "{romm}",
+        "description": "For ES-DE Android, Daijisho or Beacon reading a ROMs folder on internal storage or the SD card.",
     },
     {
         "id": "argosy",
+        "kind": "app",
         "name": "Argosy Launcher (Android)",
-        "category": "First-Party RomM Mobile",
-        "protocol": "RomM REST API + Client API Token",
-        "default_path": "https://romm.your-network.local",
+        "category": "App that connects to RomM",
+        "protocol": "RomM API",
+        "default_path": "",
         "gamelist_format": "romm-api",
         "igir_token": "{romm}",
-        "description": "Official Android launcher that browses and launches your RomM library on mobile with token pairing.",
+        "description": "Android launcher that browses and launches your RomM library.",
+        "setup": [
+            "Install Argosy from its GitHub releases on the Android device.",
+            "Add a server and enter your RomM address: {library_url}.",
+            "Sign in with a RomM account (a dedicated one is best).",
+        ],
     },
     {
         "id": "grout",
-        "name": "Grout (muOS / NextUI Linux Handhelds)",
-        "category": "First-Party RomM Handheld",
-        "protocol": "SSH Sync + RomM Device Sync Protocol",
-        "default_path": "/mnt/mmc/ROMS/{platform}",
+        "kind": "app",
+        "name": "Grout (muOS / NextUI handhelds)",
+        "category": "App that connects to RomM",
+        "protocol": "RomM API",
+        "default_path": "",
         "gamelist_format": "romm-api",
         "igir_token": "{romm}",
-        "description": "Linux handheld companion for Anbernic, Miyoo, and TrimUI devices running muOS or NextUI.",
+        "description": "Companion for Anbernic, Miyoo and TrimUI handhelds running muOS or NextUI; downloads games from RomM on the device.",
+        "setup": [
+            "Install Grout on the handheld following its README.",
+            "Point it at your RomM address: {library_url}.",
+            "Pick platforms on the device; Grout downloads into its own ROM folders.",
+        ],
     },
     {
         "id": "deckrommsync",
+        "kind": "app",
         "name": "DeckRommSync (Steam Deck)",
-        "category": "Community Handheld",
-        "protocol": "RomM REST API + WebDAV Save Sync",
-        "default_path": "/run/media/mmcblk0p1/Emulation/roms/{romm}",
-        "gamelist_format": "esde",
+        "category": "App that connects to RomM",
+        "protocol": "RomM API",
+        "default_path": "",
+        "gamelist_format": "romm-api",
         "igir_token": "{romm}",
-        "description": "Syncs Steam Deck EmuDeck / ES-DE libraries and RetroArch saves with RomM and ROMarr.",
+        "description": "Keeps a Steam Deck's EmuDeck library and saves in step with RomM.",
+        "setup": [
+            "Install DeckRommSync on the Steam Deck (desktop mode).",
+            "Enter your RomM address: {library_url}.",
+            "Choose which platforms to keep on the Deck.",
+        ],
     },
     {
         "id": "retroarch-webdav",
-        "name": "RetroArch Built-in Cloud Sync (WebDAV)",
-        "category": "Cross-Platform Save & State Sync",
-        "protocol": "WebDAV (/webdav/)",
-        "default_path": "{romm_url}/webdav/",
+        "kind": "app",
+        "name": "RetroArch cloud sync (WebDAV)",
+        "category": "Saves and states",
+        "protocol": "WebDAV",
+        "default_path": "",
         "gamelist_format": "webdav",
         "igir_token": "{romm}",
-        "description": "Zero-companion save and savestate cloud sync across PC, Raspberry Pi, Android, and handhelds.",
+        "description": "RetroArch's built-in cloud sync keeps saves and states the same on every device.",
+        "setup": [
+            "In RetroArch: Settings > Saving > Cloud Sync, turn it on and choose WebDAV.",
+            "Enter your library server's WebDAV address: {library_url}/webdav/.",
+            "Use the same account on every device.",
+        ],
     },
     {
         "id": "console-cfw-feeds",
-        "name": "Console Homebrew Feeds (Tinfoil / pkgj / pkgi / fpkgi / Kekatsu)",
-        "category": "Direct Console Installers",
-        "protocol": "HTTP/HTTPS URL Feeds",
-        "default_path": "{romm_url}/api/feeds/",
+        "kind": "app",
+        "name": "Console homebrew feeds (Tinfoil, pkgj, pkgi, Kekatsu)",
+        "category": "Console installers",
+        "protocol": "HTTP feeds",
+        "default_path": "",
         "gamelist_format": "feed",
         "igir_token": "{romm}",
-        "description": "Direct over-the-air package feeds for Switch (.nsp/.xci), PS Vita/PSP/PS3/PS4/PS5, and Nintendo DS.",
+        "description": "Install straight onto a modded Switch, PS Vita, PSP, PS3 or DS from your RomM feeds.",
+        "setup": [
+            "On the console's installer (Tinfoil, pkgj, pkgi, Kekatsu), add a custom source.",
+            "Use your RomM feed address: {library_url}/api/feeds/.",
+        ],
     },
 ]
 
+TRANSPORTS = ("local", "ssh", "rclone")
+STAGE_ROOT = "/tmp/romarr-stage"
+
+
+def _device(device_id: str) -> dict | None:
+    return next((p for p in DEVICE_PROFILES if p["id"] == device_id), None)
+
+
+def _device_root(path: str) -> str:
+    """The device's ROM folder without a per-platform placeholder.
+
+    Earlier plans asked for `.../roms/{platform}`, which Igir does not expand
+    (it would create a folder literally named `{platform}`). The platform
+    folder is the profile's Igir token, appended by the plan.
+    """
+    root = str(path or "").strip().rstrip("/")
+    for placeholder in ("{platform}", "{romm}", "{es}", "{batocera}"):
+        if root.endswith("/" + placeholder):
+            root = root[: -len(placeholder) - 1]
+    return root
+
 
 def fleet_profiles() -> dict:
-    """Return all supported multi-device & LAN/Cloud network library sync profiles."""
+    """Every supported device, grouped by kind, and whether Igir is installed."""
     return {
         "profiles": DEVICE_PROFILES,
+        "kinds": {
+            "files": "Copy games onto the device's ROM folder",
+            "app": "The device runs an app that connects to your library server",
+        },
         "igir": igir_status(),
     }
 
 
 def build_fleet_sync_plan(spec: dict | None = None) -> dict:
-    """Build a non-destructive sync/verification command plan for a target device or network share."""
+    """Plan getting games onto one device: commands for folders, steps for apps.
+
+    Nothing runs here. The plan is shown to the user, who previews it and runs
+    it on the machine that holds the library.
+    """
     import shlex
     spec = spec if isinstance(spec, dict) else {}
-    device_id = str(spec.get("device_id") or "retropie-arcadepunks").strip()
-    profile = next((p for p in DEVICE_PROFILES if p["id"] == device_id), DEVICE_PROFILES[0])
-    target_path = str(spec.get("target_path") or profile["default_path"]).strip()
-    source_path = str(spec.get("source_path") or "/library/roms").strip()
-    regions = [str(r).strip().upper() for r in (spec.get("prefer_regions") or ["USA", "WORLD", "EUR", "JPN"]) if str(r).strip()]
-    transport = str(spec.get("transport") or "local").strip().lower()
-    ssh_host = str(spec.get("ssh_host") or "pi@retropie.local").strip()
+    device_id = str(spec.get("device_id") or "es-de").strip()
+    profile = _device(device_id)
+    if profile is None:
+        return {"ok": False, "error": f"unknown device {device_id!r}"}
 
-    igir_cmd = build_igir_command({
-        "commands": ["copy", "extract", "test", "clean", "report"],
-        "input_dirs": [source_path],
-        "output_dir": target_path if transport == "local" else f"/tmp/romarr-stage/{device_id}/{profile['igir_token']}",
+    if profile["kind"] == "app":
+        library_url = str(spec.get("library_url") or "").strip().rstrip("/") or "your RomM address"
+        return {
+            "ok": True,
+            "kind": "app",
+            "device": profile,
+            "setup": [step.replace("{library_url}", library_url) for step in profile["setup"]],
+            "steps": [],
+            "igir_command": "",
+            "network_sync_command": "",
+            "gamelist_export_url": "",
+        }
+
+    transport = str(spec.get("transport") or "local").strip().lower()
+    if transport not in TRANSPORTS:
+        transport = "local"
+    mirror = bool(spec.get("mirror", False))
+    target_root = _device_root(spec.get("target_path") or profile["default_path"])
+    source = (str(spec.get("source_path") or "").strip()
+              or os.environ.get("LIBRARY_PATH") or "/roms")
+    regions = [str(r).strip().upper()
+               for r in (spec.get("prefer_regions") or ["USA", "WORLD", "EUR", "JPN"])
+               if str(r).strip()]
+    ssh_host = str(spec.get("ssh_host") or profile.get("default_ssh_host") or "user@device.local").strip()
+    token = profile["igir_token"]
+    stage = f"{STAGE_ROOT}/{device_id}"
+    output = f"{target_root}/{token}" if transport == "local" else f"{stage}/{token}"
+
+    commands = ["copy", "extract", "test", "report"]
+    if mirror and transport == "local":
+        commands.insert(3, "clean")
+    igir_cfg = {
+        "input_dirs": [source],
+        "output_dir": output,
         "dat_dirs": [str(spec.get("dat_dir") or "/config/dats")],
         "single_1g1r": bool(spec.get("single_1g1r", True)),
         "prefer_verified": True,
         "prefer_good": True,
         "prefer_regions": regions,
         "dry_run": bool(spec.get("dry_run", False)),
-    })
-    igir_str = " ".join(shlex.quote(x) for x in igir_cmd)
+    }
 
-    rsync_str = ""
+    def shell_arg(arg: str) -> str:
+        # Keep a leading ~/ outside the quotes, or the shell never expands it
+        # and Igir writes into a folder literally named "~".
+        if arg.startswith("~/"):
+            return "~/" + shlex.quote(arg[2:])
+        return shlex.quote(arg)
+
+    def quoted(cmd: list[str]) -> str:
+        return " ".join(shell_arg(x) for x in cmd)
+
+    preview = quoted(build_igir_command({**igir_cfg, "commands": ["test", "report"], "dry_run": True}))
+    copy = quoted(build_igir_command({**igir_cfg, "commands": commands}))
+
+    transfer = ""
     if transport == "ssh":
-        rsync_str = f"rsync -avz --progress --delete-after /tmp/romarr-stage/{device_id}/ {shlex.quote(ssh_host)}:{shlex.quote(target_path)}"
+        delete = " --delete-after" if mirror else ""
+        # rsync resolves a relative remote path from the login's home folder.
+        remote = target_root[2:] if target_root.startswith("~/") else target_root
+        transfer = (f"rsync -avz --progress{delete} {shlex.quote(stage + '/')} "
+                    f"{shlex.quote(ssh_host + ':' + remote + '/')}")
     elif transport == "rclone":
-        rsync_str = f"rclone sync /tmp/romarr-stage/{device_id}/ {shlex.quote(target_path)} --progress"
+        verb = "sync" if mirror else "copy"
+        transfer = f"rclone {verb} {shlex.quote(stage + '/')} {shlex.quote(target_root + '/')} --progress"
+
+    gamelist = (f"/api/v1/frontend/export?format={profile['gamelist_format']}"
+                if profile["gamelist_format"] in ("esde", "launchbox", "playnite") else "")
+
+    steps = [
+        {"title": "Preview: check what would be copied (changes nothing)", "command": preview},
+        {"title": ("Copy verified games into the device folder" if transport == "local"
+                   else "Copy verified games into a staging folder"), "command": copy},
+    ]
+    if transfer:
+        steps.append({"title": "Send them to the device", "command": transfer})
+    if gamelist:
+        steps.append({"title": "Download the frontend's game list", "url": gamelist})
+
+    warnings = []
+    if mirror:
+        warnings.append("Mirror is on: files on the device that are not in this set will be deleted.")
 
     return {
         "ok": True,
+        "kind": "files",
         "device": profile,
-        "target_path": target_path,
-        "igir_command": igir_str,
-        "network_sync_command": rsync_str,
-        "gamelist_export_url": f"/api/v1/frontend/export?format={profile['gamelist_format']}" if profile["gamelist_format"] in ("esde", "launchbox", "playnite") else "",
+        "transport": transport,
+        "mirror": mirror,
+        "target_path": target_root,
+        "output_path": output,
+        "steps": steps,
+        "warnings": warnings,
+        "preview_command": preview,
+        "igir_command": copy,
+        "network_sync_command": transfer,
+        "gamelist_export_url": gamelist,
     }
 
 
-def mcp_manifest(base_url: str = "http://localhost:6868") -> dict:
-    """Expose ROMarr's capabilities and Open-Eyes desktop pairing metadata for MCP hosts."""
-    return {
-        "name": "romarr-mcp",
-        "version": "1.0.0",
-        "open_eyes_repo": "https://github.com/BlizzHacker/open-eyes",
-        "base_url": base_url,
-        "tools": [
-            {"name": "romarr_library_status", "method": "GET", "path": "/api/v1/library",
-             "description": "List connected library servers (RomM, Retrom, Gaseous, Gameyfin) and their health."},
-            {"name": "romarr_igir_1g1r", "method": "POST", "path": "/api/v1/hub/igir",
-             "description": "Preview or run Igir v5.8.0 1G1R verification and {romm} sorting."},
-            {"name": "romarr_exo2romm_repackage", "method": "POST", "path": "/api/v1/hub/exo2romm",
-             "description": "Preview or repackage eXoDOS game zips for standalone RomM playback (crediting derkommutator/eXo2romm)."},
-            {"name": "romarr_fleet_sync_plan", "method": "POST", "path": "/api/v1/hub/fleet",
-             "description": "Build a 1G1R + gamelist.xml sync plan for ES-DE, RetroPie/ArcadePunks, Batocera, Argosy, Grout, or Steam Deck."},
-            {"name": "romarr_search_releases", "method": "GET", "path": "/api/v1/release",
-             "description": "Interactive search across Prowlarr indexers and sandboxed ROM Hub plugins."},
-            {"name": "romarr_trigger_command", "method": "POST", "path": "/api/v1/command",
-             "description": "Run a ROMarr background command (refresh, search, import)."},
-        ],
-        "mcp_client_config": {
-            "mcpServers": {
-                "open-eyes": {
-                    "command": "npx",
-                    "args": ["-y", "github:BlizzHacker/open-eyes"]
-                },
-                "romarr": {
-                    "command": "npx",
-                    "args": ["-y", "mcp-remote", f"{base_url}/api/v1/mcp"],
-                    "env": {
-                        "ROMARR_URL": base_url,
-                        "ROMARR_API_KEY": "<YOUR_ROMARR_API_KEY>"
-                    }
-                }
-            }
-        }
-    }
+def mcp_manifest(base_url: str = "<YOUR_ROMARR_URL>") -> dict:
+    """Describe the real MCP endpoint with placeholder-only owner connection examples."""
+    from . import mcp
+    endpoint = base_url.rstrip("/") + mcp.PATH
+    return {"name": "romarr-mcp", "version": "1.0.0", "base_url": base_url,
+            "endpoint": endpoint, "transport": "streamable-http", "stateless": True,
+            "protocol_versions": list(mcp.VERSIONS), "tools": mcp.tools(),
+            "writes": "Disabled unless ROMARR_MCP_WRITE=1; never enabled on Android",
+            "mcp_client_config": {"mcpServers": {"romarr": {
+                "type": "http", "url": endpoint,
+                "headers": {"X-Api-Key": "<YOUR_ROMARR_API_KEY>"}}}},
+            "stdio_config": {"mcpServers": {"romarr": {
+                "command": "python", "args": ["-m", "romarr.mcp"],
+                "env": {"ROMARR_URL": base_url, "ROMARR_API_KEY": "<YOUR_ROMARR_API_KEY>"}}}},
+            "optional_desktop_control": {"name": "Open-Eyes", "required": False,
+                "repository": "https://github.com/BlizzHacker/open-eyes"}}
 
 
 # ---------------------------------------------- eXo2romm (eXoDOS -> RomM) --

@@ -18,6 +18,7 @@ import threading
 import time
 from dataclasses import dataclass
 
+import re
 import requests
 
 from .libraries import (DEFAULT_BACKGROUND_TIMEOUT, Game,
@@ -284,23 +285,155 @@ class QBittorrent:
             req_kwargs["timeout"] = self._deadline_timeout(deadline, base_timeout)
         return self._session.post(self._url(path), **req_kwargs)
 
-    def add(self, magnet_or_url: str, *, save_path: str | None = None) -> bool:
+    def _already_owned(self, row: dict) -> bool:
+        """Whether a torrent already carries a ROMarr request or collection tag."""
+        tags = row.get("tags", "")
+        parts = tags.split(",") if isinstance(tags, str) else tags if isinstance(tags, (list, tuple, set)) else []
+        selective_hashes = {str(h or "").strip().lower() for h in self._selective_hashes}
+        return (str(row.get("hash") or "").strip().lower() in selective_hashes
+                or any(str(part).strip().startswith("romarr-") for part in parts))
+
+    def _remove_torrent_tag(self, torrent_hash: str, tag: str) -> None:
+        """Remove only this attempt's adoption tag after an incomplete attach."""
+        try:
+            removed = self._post(
+                "torrents/removeTags",
+                data={"hashes": torrent_hash, "tags": tag},
+                timeout=self._config.timeout,
+            )
+            if not removed.ok:
+                log.warning("qbittorrent removeTags failed for %s: %s",
+                            torrent_hash[:12], removed.status_code)
+        except requests.RequestException:
+            log.warning("qbittorrent removeTags error for %s", torrent_hash[:12])
+
+    def _rollback_duplicate_attach(self, torrent_hash: str, tag: str, *,
+                                   remove_tag: bool,
+                                   restore_category: str | None) -> None:
+        """Undo this attempt's tag and category changes after an incomplete attach."""
+        if remove_tag:
+            self._remove_torrent_tag(torrent_hash, tag)
+        if restore_category is not None:
+            try:
+                restored = self._post(
+                    "torrents/setCategory",
+                    data={"hashes": torrent_hash, "category": restore_category},
+                    timeout=self._config.timeout,
+                )
+                if not restored.ok:
+                    log.warning("qbittorrent category restore failed for %s: %s",
+                                torrent_hash[:12], restored.status_code)
+            except requests.RequestException:
+                log.warning("qbittorrent category restore error for %s", torrent_hash[:12])
+
+    def _adopt_duplicate_magnet(self, magnet_or_url: str, tag: str,
+                                category: str | None = None) -> bool:
+        """Attach an existing unowned qBittorrent torrent atomically."""
+        if not str(magnet_or_url or "").startswith("magnet:"):
+            return False
+        from .retained_collection import magnet_hash
+
+        infohash = magnet_hash(magnet_or_url)
+        if not infohash:
+            return False
+        with self._selection_lock:
+            try:
+                existing = [row for row in self.torrents()
+                            if _row_matches_infohash(row, infohash)]
+            except (requests.RequestException, QbitAuthenticationError,
+                    ValueError, KeyError, TypeError):
+                return False
+            if len(existing) != 1:
+                return False
+            if self._already_owned(existing[0]):
+                # Another request (or a retained collection) already tracks
+                # it; a second tag would make both imports ambiguous.
+                log.warning("qbittorrent duplicate is already tracked by ROMarr; not attaching")
+                return False
+            torrent_hash = str(existing[0].get("hash") or "").strip()
+            if not torrent_hash:
+                return False
+            original_category = str(existing[0].get("category") or "").strip()
+            restore_cat = (original_category
+                           if original_category != (category or self._config.category) else None)
+            tag_added = False
+            category_changed = False
+            try:
+                tagged = self._post(
+                    "torrents/addTags",
+                    data={"hashes": torrent_hash, "tags": tag},
+                    timeout=self._config.timeout,
+                )
+                if tagged is None or not tagged.ok:
+                    return False
+                tag_added = True
+                categorized = self._post(
+                    "torrents/setCategory",
+                    data={"hashes": torrent_hash,
+                          "category": (category or self._config.category)},
+                    timeout=self._config.timeout,
+                )
+                if categorized is None or not categorized.ok:
+                    self._rollback_duplicate_attach(
+                        torrent_hash, tag, remove_tag=True, restore_category=None)
+                    return False
+                category_changed = True
+                try:
+                    check = self._get(
+                        "torrents/info", params={"tag": tag},
+                        timeout=self._config.timeout,
+                    )
+                    rows = check.json() if check.ok else []
+                except (requests.RequestException, ValueError):
+                    rows = []
+                matches = [
+                    row for row in rows
+                    if isinstance(row, dict)
+                    and _row_has_tag(row, tag)
+                    and _row_matches_infohash(row, infohash)
+                    and (row.get("category") or "") == (category or self._config.category)
+                ]
+                if len(matches) == 1:
+                    self._added.job_id = "qbit-tag:" + tag
+                    log.info("attached request to existing qBittorrent torrent %s",
+                             torrent_hash[:12])
+                    return True
+                self._rollback_duplicate_attach(
+                    torrent_hash, tag, remove_tag=True, restore_category=restore_cat)
+                return False
+            except requests.RequestException:
+                self._rollback_duplicate_attach(
+                    torrent_hash, tag,
+                    remove_tag=tag_added,
+                    restore_category=restore_cat if category_changed else None)
+                return False
+
+    def add(self, magnet_or_url: str, *, save_path: str | None = None,
+            category: str | None = None) -> bool:
+        """Add a torrent, attaching a verified duplicate to this request."""
+        self._added.job_id = ""
+        self._added.error = ""
         if not self._authed:
             self.login()
         tag = "romarr-" + secrets.token_hex(12)
-        data = {"urls": magnet_or_url, "category": self._config.category,
+        data = {"urls": magnet_or_url, "category": category or self._config.category,
                 "tags": tag}
         if save_path:
             data["savepath"] = save_path
         response = self._post("torrents/add", data=data, timeout=self._config.timeout)
+        if response.status_code == 409 and self._adopt_duplicate_magnet(magnet_or_url, tag, category):
+            return True
         if not response.ok:
             log.warning("qbittorrent add failed: %s", response.status_code)
+            return False
+        if str(getattr(response, "text", "") or "").strip().lower().startswith("fails"):
+            self._added.error = "qBittorrent did not accept the torrent"
             return False
         self._added.job_id = "qbit-tag:" + tag
         return True
 
     def add_torrent_file(self, torrent: bytes, *,
-                         save_path: str | None = None) -> bool:
+                         save_path: str | None = None, category: str | None = None) -> bool:
         """Upload a locally fetched .torrent and confirm qBittorrent added it.
 
         Prowlarr links are only reachable from ROMarr's network and carry its
@@ -312,7 +445,7 @@ class QBittorrent:
             self.login()
         tag = "romarr-" + secrets.token_hex(12)
         self._added.job_id = ""
-        data = {"category": self._config.category, "tags": tag}
+        data = {"category": category or self._config.category, "tags": tag}
         if save_path:
             data["savepath"] = save_path
         try:
@@ -1018,6 +1151,41 @@ class QBittorrent:
                 done.append(row)
         return done
 
+    def progress(self, *, deadline: float | None = None) -> dict[str, dict]:
+        """Read category-scoped progress, without changing torrent state."""
+        import math
+        if deadline is None:
+            deadline = time.monotonic() + 2
+        if not self._authed and not self.login(_deadline=deadline):
+            return {}
+        response = self._get("torrents/info", params={"category": self._config.category},
+                             _deadline=deadline, timeout=2)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, list):
+            return {}
+        out = {}
+        for row in payload[:10000]:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("hash") or "").lower()
+            if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", key):
+                continue
+            try:
+                percent = float(row.get("progress") or 0)
+                eta = float(row.get("eta", -1))
+                speed = float(row.get("dlspeed") or 0)
+                if not all(math.isfinite(v) for v in (percent, eta, speed)):
+                    continue
+            except (ValueError, TypeError, OverflowError):
+                continue
+            out[key] = {"tags": [t.strip() for t in str(row.get("tags") or "").split(",") if t.strip()],
+                        "progress": round(max(0, min(1, percent)) * 100, 1),
+                        "eta": int(eta) if 0 <= eta < 8640000 else None,
+                        "speed": max(0, int(speed)),
+                        "dl_state": str(row.get("state") or "")[:80]}
+        return out
+
     def reselect(self, row: dict) -> bool:
         """Set every file in one torrent back to normal priority.
 
@@ -1106,6 +1274,12 @@ class Romm:
 
     # Health and badge calls get their own short budget; see count().
     HEALTH_TIMEOUT = 5
+
+    # The three `limit=1` queries behind counts(). Each returns a total and no
+    # rows, but the `missing` filter is the slow part on a large library: a
+    # 28k-game RomM measured 6-8 s warm and 9.6 s with a cold MariaDB buffer
+    # pool (issue #216), so the 5 s health budget hung up on a healthy server.
+    COUNT_TIMEOUT = 60
 
     # RomM sorts by name using a natural-sort expression -- nested
     # REGEXP_REPLACE over roms.name. Being computed, no index can serve it, so
@@ -1220,6 +1394,39 @@ class Romm:
         self._token_from_login = bool(self._token)
         return self._token or None
 
+    WRITE_SCOPES = "roms.read roms.write"
+
+    def write_token(self, refresh: bool = False) -> str | None:
+        """A bearer token that may edit ROMs, for soundtrack uploads and undo.
+
+        An operator-configured API token is used as it is (RomM decides what it
+        may do). Otherwise this is a second password grant with the write scope,
+        cached apart from the read-only token and renewed shortly before it
+        expires. Returns None when there is nothing to sign in with, or RomM
+        refuses; the body of a refusal is never logged.
+        """
+        if self._config.api_token:
+            return self._config.api_token
+        cached = getattr(self, "_write_token", "")
+        if cached and not refresh:
+            expiry = self._jwt_expiry(cached)
+            if expiry is None or expiry - time.time() >= self.REFRESH_MARGIN:
+                return cached
+        if not (self._config.username and self._config.password):
+            return None
+        response = self._session.post(
+            f"{self._config.base_url.rstrip('/')}/api/token",
+            data={"grant_type": "password", "username": self._config.username,
+                  "password": self._config.password, "scope": self.WRITE_SCOPES},
+            timeout=self._config.timeout, allow_redirects=False)
+        if not response.ok:
+            log.warning("romm write auth failed with status %s", response.status_code)
+            self._write_token = ""
+            return None
+        self._write_token = response.json().get("access_token", "")
+        return self._write_token or None
+
+
     def _token_refused_with_500(self) -> bool:
         """Whether a 500 is RomM 5.3.1 rejecting our expired bearer token.
 
@@ -1332,14 +1539,14 @@ class Romm:
 
         RomM 5.x answers this without a walk -- `missing` is a server-side
         filter, so each number is a `limit=1` query that returns a `total` and
-        no rows. Three calls on the health budget, the same budget `count()`
-        already runs on.
+        no rows. They run on COUNT_TIMEOUT, not the health budget: the filtered
+        queries are the slow ones on a large library (issue #216).
         """
         url = f"{self._config.base_url.rstrip('/')}/api/roms"
 
         def ask(**extra) -> int:
             response = self._get(url, {"limit": 1, **self.CHEAP_QUERY, **extra},
-                                 self.HEALTH_TIMEOUT)
+                                 self.COUNT_TIMEOUT)
             response.raise_for_status()
             payload = response.json()
             if isinstance(payload, dict):

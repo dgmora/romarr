@@ -145,8 +145,8 @@ def test_transmission_reports_a_non_success_result_as_failure():
                             session=session).add("magnet:?xt=urn:btih:a")
 
 
-def test_transmission_accepts_its_own_duplicate():
-    """Only an existing torrent in our label AND directory can be adopted."""
+def test_transmission_refuses_an_already_owned_duplicate():
+    """A second request cannot adopt a torrent already labelled for ROMarr."""
     from romarr.downloaders import Transmission, TransmissionConfig
 
     session = FakeSession([
@@ -157,9 +157,11 @@ def test_transmission_accepts_its_own_duplicate():
             "hashString": "a" * 40, "labels": ["romarr"],
             "downloadDir": "/downloads/romarr"}]}}),
     ])
-    assert Transmission(TransmissionConfig(base_url="http://t:9091",
-                        save_path="/downloads/romarr"),
-                        session=session).add("magnet:?xt=urn:btih:a")
+    assert not Transmission(TransmissionConfig(base_url="http://t:9091",
+                            save_path="/downloads/romarr"),
+                            session=session).add("magnet:?xt=urn:btih:" + "a" * 40)
+    assert [json.loads(call["data"])["method"] for call in session.calls] == [
+        "session-get", "torrent-add", "torrent-get"]
 
 
 # --- Deluge: log in first, and check the daemon is attached ----------------

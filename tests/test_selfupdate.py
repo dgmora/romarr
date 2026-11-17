@@ -47,8 +47,11 @@ def test_docker_guidance_names_the_host_commands():
     out = selfupdate.docker_guidance()
     assert out["ok"] is False
     joined = " ".join(out["guidance"])
-    assert "docker pull" in joined
-    assert "compose" in joined
+    assert "Compose" in joined
+    assert "image digest" in joined
+    assert "rollback" in joined
+    assert "docker stop" not in joined
+    assert "docker rm" not in joined
 
 
 # -- channel targeting --------------------------------------------------------
@@ -170,7 +173,8 @@ def test_the_script_is_fail_stop_and_ff_only(monkeypatch):
     assert "set -eu" in script
     assert "git merge --ff-only" in script
     assert "git reset --hard" not in script
-    assert "git reset --keep" in script
+    assert "git checkout --detach --no-overwrite-ignore" in script
+    assert 'git update-ref "refs/heads/$BRANCH" "$PRE" "$POST"' in script
     assert "git checkout main" not in script
     assert "systemctl restart" in script
     assert "RECOVERY REQUIRED" in script

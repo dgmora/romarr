@@ -2,15 +2,23 @@
 
 Transmission clients accept a download directory, expose the returned torrent
 hash as the job identity and poll fully completed, nonempty torrents. Polling
-filters by the configured label and directory before returning import paths.
+filters by the configured label before returning import paths. Soundtrack torrents
+use a separate label and never enter normal ROM completion polling.
 Paths come from actual torrent files, which may differ from the display name.
 Multiple files must share a safe root; metadata must be complete before import.
 
-A duplicate submission is accepted only when the existing torrent's hash, label
-and directory match. A foreign or uninspectable duplicate fails without moving,
-relabeling or deleting an existing torrent. This matters when several applications
-share the same Transmission instance. Configure a dedicated label and directory
-when duplicate adoption is required. RPC failures remain visible to the importer.
+An unowned duplicate magnet can be attached in its existing absolute download
+directory. ROMarr verifies its hash, preserves unrelated labels, applies the
+configured label, and verifies the result. Failed verification removes only the
+attempted label. Torrents already labelled for ROMarr, another ROMarr request or
+a retained collection are refused. Metainfo duplicates are refused; attachment
+requires the magnet identity. Files are never moved or deleted during attachment.
+Configure remote path mappings when the existing directory differs on the ROMarr
+host. RPC failures remain visible to the importer.
+
+Queue percentage, speed and ETA use read-only RPC calls within the shared queue
+deadline. Soundtrack grabs use a separate label and client-scoped hash watch;
+completion uses the same validated payload paths as ROM imports.
 
 Labelled submissions discover and cache the RPC version through `session-get`.
 A successful connection test supplies that cache. RPC 17 and later receive labels

@@ -285,6 +285,7 @@ def test_authentication_configure_without_shared_rom_hub(tmp_path, monkeypatch):
     monkeypatch.setattr(hub, "HOME", tmp_path)
     import sys
     from types import SimpleNamespace
+    monkeypatch.setattr(hub, "HOME", tmp_path / "rom-hub")
     monkeypatch.setitem(sys.modules, "romarr.ia_auth", None)
     monkeypatch.setattr("rom_hub.registry.Registry.get",
                         lambda self, slug: SimpleNamespace(slug=slug))
@@ -327,6 +328,7 @@ def test_search_falls_back_when_ia_modules_are_absent(tmp_path, monkeypatch):
     monkeypatch.setattr(hub, "HOME", tmp_path)
     import sys
     from types import SimpleNamespace
+    monkeypatch.setattr(hub, "HOME", tmp_path / "rom-hub")
     monkeypatch.setitem(sys.modules, "romarr.ia_auth", None)
     monkeypatch.setitem(sys.modules, "romarr.ia_session", None)
     plugin = SimpleNamespace(slug="homebrew", enabled=True,
@@ -336,6 +338,9 @@ def test_search_falls_back_when_ia_modules_are_absent(tmp_path, monkeypatch):
                         lambda group, **kw: SimpleNamespace(
                             statuses=[],
                             results=[SimpleNamespace(model_dump=lambda: dict(ROW, plugin="homebrew"))]))
+    # Search plumbing, not confinement: hosts without pyseccomp refuse plugins
+    # unless the operator opts in, so opt in explicitly here.
+    monkeypatch.setenv("ROMARR_ALLOW_UNSANDBOXED_PLUGINS", "1")
     rows, err = hub.search("Super Metroid")
     assert err == ""
     assert len(rows) == 1 and rows[0]["plugin"] == "homebrew"

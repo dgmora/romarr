@@ -13,6 +13,10 @@ details it does handle are the ones that silently corrupt a library:
 
 from __future__ import annotations
 
+from .import_duplicates import duplicate_reason, stream_sha1
+from .tar_archive import TAR_SUFFIXES, TarSource, is_tar_name
+from .switch_attach import ATTACH_PLATFORMS, attach_dir as switch_attach_dir, is_real_directory_chain
+
 import json
 import logging
 import errno
@@ -46,7 +50,12 @@ log = logging.getLogger(__name__)
 #: overwhelmingly `.7z` -- 2,621 PlayStation entries, 2,409 PS2, 1,470 Wii --
 #: and an importer that cannot open the format the content ships in supports
 #: the platform on paper only.
-ARCHIVE_SUFFIXES = (".zip", ".7z", ".rar")
+ARCHIVE_SUFFIXES = (".zip", ".7z", ".rar") + TAR_SUFFIXES
+
+
+def is_archive_name(name):
+    """Recognize complete archive extensions, including compressed TAR names."""
+    return str(name).lower().endswith(ARCHIVE_SUFFIXES)
 
 #: Handled by the standard library, with no tool to install.
 _STDLIB_ARCHIVES = (".zip",)
@@ -264,6 +273,7 @@ class ImportResult:
     info: dict = field(default_factory=dict)
     import_method: str = ""
     fallback_reason: str = ""
+    sha1: str = ""
 
 
 def is_safe_name(name: str, root: Path) -> bool:
@@ -893,7 +903,7 @@ class _DirectorySource(_PathSource):
                 # Read through the set's first volume, never on its own.
                 continue
             relative = entry.relative_to(path).as_posix()
-            if entry not in volume_sets and entry.suffix.lower() not in ARCHIVE_SUFFIXES:
+            if entry not in volume_sets and not is_archive_name(entry.name):
                 if relative in self.members:
                     raise ValueError(f"duplicate source member: {relative}")
                 self.members[relative] = (self, relative)
@@ -1014,7 +1024,7 @@ def _source_for(download: Path, platform: Platform | None = None, *,
             if not single_file.resolve().is_relative_to(download.resolve()):
                 raise ValueError(f"source escapes download directory: {single_file}")
             single_suffix = single_file.suffix.lower()
-            if single_suffix in _STDLIB_ARCHIVES or single_suffix in ARCHIVE_SUFFIXES:
+            if is_archive_name(single_file.name):
                 return _source_for(single_file, platform, staging_budget=staging_budget)
 
     # For MAME, FBNeo and DOSBox the archive IS the ROM: the core opens it and
@@ -1022,7 +1032,7 @@ def _source_for(download: Path, platform: Platform | None = None, *,
     # of a romset and import that, which succeeds and leaves an entry no core
     # can load. Treat it as a plain file.
     if (platform is not None and platform.archive_is_the_rom
-            and download.is_file()):
+            and download.is_file() and not is_tar_name(download.name)):
         return _PathSource(download)
 
     if (download.is_dir()
@@ -1030,6 +1040,8 @@ def _source_for(download: Path, platform: Platform | None = None, *,
                                       and platform.media != "digital"))):
         return _DirectorySource(download)
 
+    if download.is_file() and is_tar_name(download.name):
+        return TarSource(download)
     suffix = download.suffix.lower()
     if download.is_file() and suffix in _STDLIB_ARCHIVES:
         # ZipFile allocates ZipInfo entries during construction. Apply the
@@ -1052,7 +1064,7 @@ def _source_for(download: Path, platform: Platform | None = None, *,
         return _rar_source(download, [download])
     if download.is_file() and suffix == ".rar" and rar_tool() is not None:
         return _RarToolSource(download, rar_tool())
-    if download.is_file() and suffix in ARCHIVE_SUFFIXES:
+    if download.is_file() and is_archive_name(download.name):
         tool = bsdtar_path()
         if tool is None:
             raise MissingArchiveTool(
@@ -1168,8 +1180,10 @@ def _digital_set_name(download: Path) -> str:
     was truncated to `Call.of.Duty.Modern.Warfare.4.[DODI`. Only strip the
     suffix when `download` is an archive file.
     """
-    if download.is_file() and download.suffix.lower() in ARCHIVE_SUFFIXES:
-        return download.stem
+    if download.is_file() and is_archive_name(download.name):
+        for extension in sorted(ARCHIVE_SUFFIXES, key=len, reverse=True):
+            if download.name.lower().endswith(extension):
+                return download.name[:-len(extension)]
     return download.name
 
 
@@ -1287,7 +1301,10 @@ def import_rom(download: Path, platform: Platform, library_root: Path, *,
                require_verified: bool = False,
                layout: str = "flat", translation: bool = False,
                rename: bool = False,
-               platform_folders=None, prefer_hardlinks: bool = False, selected_primaries=None, bundle_routes=None, export_only: bool = False) -> list[ImportResult]:
+               platform_folders=None, prefer_hardlinks: bool = False, selected_primaries=None, bundle_routes=None,
+               requested_game: str | None = None, catalog_platforms=None,
+               hash_index=None, duplicate_roots=(),
+               switch_extras: bool = False, export_only: bool = False) -> list[ImportResult]:
     """Place every ROM from a finished download into the library.
 
     A cartridge zip may hold several games (a 3-in-1 collection, a bundle)
@@ -1300,6 +1317,8 @@ def import_rom(download: Path, platform: Platform, library_root: Path, *,
     keep-both case where a T-En patch sits beside the original dump.
     The rename option uses verified DAT names for single-file ROMs, retaining
     the physical extension. Multi-file members keep their reference names.
+    `switch_extras` files a Switch update or DLC inside its game's folder
+    when that game already has one (see switch_attach).
     """
     if export_only and str(layout).lower() != "flat":
         return [ImportResult(False, None, "standalone export supports only flat library layout")]
@@ -1316,7 +1335,9 @@ def import_rom(download: Path, platform: Platform, library_root: Path, *,
     try:
         source = _source_for(download, platform)
         if isinstance(source, _PathSource):
-            source.prefer_hardlinks = prefer_hardlinks
+            # A request-gated import must copy into private staging; a hardlink
+            # would let another process mutate already-verified staged bytes.
+            source.prefer_hardlinks = prefer_hardlinks and requested_game is None
         candidates = source.names()
         chosen_sets = source.rom_sets(platform)
     except (MissingArchiveTool, OSError, ValueError, zipfile.BadZipFile, RuntimeError, subprocess.SubprocessError) as exc:
@@ -1337,7 +1358,10 @@ def import_rom(download: Path, platform: Platform, library_root: Path, *,
             overwrite=overwrite, dats=dats, require_verified=require_verified,
             layout=layout, translation=translation, rename=rename,
             platform_folders=platform_folders, prefer_hardlinks=prefer_hardlinks,
-            selected_primaries=selected_primaries, bundle_routes=bundle_routes)
+            selected_primaries=selected_primaries, bundle_routes=bundle_routes,
+            requested_game=requested_game, catalog_platforms=catalog_platforms,
+            hash_index=hash_index, duplicate_roots=duplicate_roots,
+            switch_extras=switch_extras)
     finally:
         source.close()
 
@@ -1347,7 +1371,10 @@ def _import_rom_from_source(source, candidates, chosen_sets, download, platform,
                             require_verified=False, layout="flat",
                             translation=False, rename=False,
                             platform_folders=None, prefer_hardlinks=False,
-                            selected_primaries=None, bundle_routes=None):
+                            selected_primaries=None, bundle_routes=None,
+                            requested_game=None, catalog_platforms=None,
+                            hash_index=None, duplicate_roots=(),
+                            switch_extras=False):
     """Finish import while the validated source and its scratch ZIPs remain open."""
     if selected_primaries is not None:
         selected = set(selected_primaries)
@@ -1362,14 +1389,40 @@ def _import_rom_from_source(source, candidates, chosen_sets, download, platform,
             reason += f"; archive inside download directory cannot be imported: {nested[0]}"
         return [ImportResult(False, None, reason)]
 
+    # Optional request-aware gate: deliberately NOT activated by scheduled
+    # imports until app.py binds it to a durable queue/source identity. Manual
+    # and legacy import callers retain their existing behavior by default.
+    # A held/rejected result returns before any destination is created.
+    assessment = None
+    if requested_game is not None:
+        if overwrite:
+            return [ImportResult(False, None, "request identity REVIEW_REQUIRED: overwrites need separate review")]
+        if any(group.is_multi_file for group in chosen_sets):
+            return [ImportResult(False, None, "request identity REVIEW_REQUIRED: multi-file publication needs atomic staging")]
+        from .request_evidence import evaluate_source_request
+
+        assessment = evaluate_source_request(
+            source, chosen_sets, dats, requested_game, platform.slug,
+            catalog_platforms=catalog_platforms,
+        )
+        if assessment.decision.action != "import":
+            decision = assessment.decision
+            return [ImportResult(
+                False, None, f"request identity {decision.code}: {decision.message}")]
+
     results: list[ImportResult] = []
+    published_hashes = {}
     planned = []
+    attached: dict[Path, Path] = {}
     destinations = {}
     file_destinations = {}
     destination_parents = {}
     for chosen in chosen_sets:
         try:
-            verdict = verify_set(source, chosen.members, dats)
+            # Preserve the exact catalog/game selected by request assessment.
+            # Legacy imports retain their historic first-match DAT behavior.
+            verdict = (assessment.verification if assessment is not None
+                       else verify_set(source, chosen.members, dats))
         except (OSError, ValueError, zipfile.BadZipFile, RuntimeError, subprocess.SubprocessError) as exc:
             results.append(ImportResult(False, None, f"verification failed: {exc}"))
             continue
@@ -1379,6 +1432,19 @@ def _import_rom_from_source(source, candidates, chosen_sets, download, platform,
                 f"refused: {verdict.detail or verdict}",
                 verification=verdict))
             continue
+
+        if hash_index is not None and len(hash_index) and not chosen.is_multi_file:
+            try:
+                hashes = source.hash(chosen.primary, suffix="")
+                reason = duplicate_reason(hash_index, (hashes or {}).get("sha1", ""),
+                                          duplicate_roots or (library_root,),
+                                          suffix=Path(chosen.primary).suffix, published=published_hashes)
+            except (OSError, ValueError, zipfile.BadZipFile, RuntimeError, subprocess.SubprocessError) as exc:
+                results.append(ImportResult(False, None, f"duplicate check failed: {exc}", verification=verdict))
+                continue
+            if reason:
+                results.append(ImportResult(False, None, reason, verification=verdict))
+                continue
 
         target_dir = platform_dir(library_root, platform,
                                   layout=layout, translation=translation,
@@ -1398,6 +1464,11 @@ def _import_rom_from_source(source, candidates, chosen_sets, download, platform,
                     results.append(ImportResult(False, None, "invalid reviewed destination; review the bundle again"))
                     continue
                 destination = target_dir / relative
+            elif switch_extras and platform.slug in ATTACH_PLATFORMS:
+                attach = switch_attach_dir(Path(chosen.primary).name, target_dir)
+                if attach is not None:
+                    destination = attach / destination.name
+                    attached[destination] = target_dir
         destination_keys = {Path(str(destination).casefold())}
         if not chosen.is_multi_file and bundle_routes is not None:
             destination_keys.add(Path(str(destination.parent.resolve() / destination.name).casefold()))
@@ -1424,6 +1495,10 @@ def _import_rom_from_source(source, candidates, chosen_sets, download, platform,
             source.transfers = {}
         target_dir = destination.parent
         if not chosen.is_multi_file:
+            if destination in attached and not is_real_directory_chain(attached[destination], target_dir):
+                results.append(ImportResult(False, destination,
+                                            "the game's folder changed into a link before import; nothing published"))
+                continue
             try:
                 target_dir.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
@@ -1442,15 +1517,44 @@ def _import_rom_from_source(source, candidates, chosen_sets, download, platform,
                         raise ValueError("empty ROM payload")
                     if platform.slug in ("ps2", "ngc", "xbox") and actual_size < 8 * 1024 * 1024:
                         raise ValueError(f"too small to be a {platform.name} disc image ({actual_size // (1024*1024)}MB < 8MB)")
+                    if assessment is not None:
+                        from .request_evidence import evaluate_source_request
+
+                        # Re-hash the copied bytes that will actually be
+                        # published. The earlier source approval is invalid if
+                        # another process changed the loose download meanwhile.
+                        staged_evidence = evaluate_source_request(
+                            _PathSource(staged), (chosen,), dats,
+                            requested_game, platform.slug,
+                            catalog_platforms=catalog_platforms,
+                        )
+                        if (staged_evidence.decision.action != "import"
+                                or staged_evidence.verification != verdict):
+                            raise ValueError("request identity changed during staging; nothing published")
+                    imported_sha1 = ""
+                    if hash_index is not None:
+                        with staged.open("rb") as copied:
+                            imported_sha1 = stream_sha1(copied)
+                        reason = duplicate_reason(hash_index, imported_sha1,
+                                                  duplicate_roots or (library_root,),
+                                                  suffix=staged.suffix, published=published_hashes)
+                        if reason:
+                            results.append(ImportResult(False, destination, reason, verification=verdict))
+                            continue
                     reason = _publish_import(staged, destination, overwrite=overwrite)
                     if reason:
                         raise ValueError(reason)
             except (OSError, ValueError, zipfile.BadZipFile, RuntimeError, subprocess.SubprocessError) as exc:
                 results.append(ImportResult(False, destination, f"copy/extraction or publication failed: {exc}"))
                 continue
+            if imported_sha1:
+                from .hashes import Entry
+                published_hashes[imported_sha1] = Entry(imported_sha1, destination.stem,
+                                                       platform.slug, path=str(destination.absolute()))
             log.info("imported %s -> %s", chosen.primary, destination)
             results.append(ImportResult(True, destination,
-                                        verification=verdict, **_transfer_summary(source)))
+                                        verification=verdict, sha1=imported_sha1,
+                                        **_transfer_summary(source)))
             continue
 
         if destination.exists() and any(destination.iterdir()) and not overwrite:
